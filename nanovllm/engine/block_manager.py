@@ -1,0 +1,161 @@
+from collections import deque
+from typing import List, Tuple
+import xxhash
+import torch
+
+from nanovllm_self.nanovllm.engine.Sequence import Sequence
+
+engine_config = {
+    "enable_prefix_caching": True,  # 启用前缀共享
+    "prefix_cache_hash_algo": "sha256",  # 哈希算法
+    "block_size": 32,  # 推荐 32
+}
+
+class Block:
+    """
+    用于维护kvcache的状态，真正的存储在kvcache中，kvcache依靠block索引与block联系
+    """
+    def __init__(self, block_id, block_size):
+        self.block_id = block_id  # 分配好就不再修改
+        self.block_size = block_size  # 分配好就不再修改
+        self.ref_count = 0
+        self.hash = -1
+        self.token_ids = []
+        self.ptr = None  # 指向GPU物理块的指针
+        self.prev_hash = -1
+
+    def update(self, h: int, token_ids: List[int], prev_hash):
+        self.hash = h
+        self.token_ids = token_ids.copy
+        self.prev_hash = prev_hash
+
+    def reset(self):
+        self.ref_count = 0
+        self.hash = -1
+        self.token_ids = []
+        self.prev_hash = -1
+
+class block_manager:
+    def __init__(self, num_blocks=1024, block_size=32, num_layers=32, num_heads=32, head_dim=128, enable_prefix_cache=False, dtype=torch.bfloat16, device='cuda:0'):
+        """
+        总共 4096 个块
+        每个块4个token
+        """
+        self.num_blocks = num_blocks  # 需要分配的块的数量
+        self.block_size = block_size  # 一个块分配多大的空间，即一个块多少个token
+        self.enable_prefix_cache = enable_prefix_cache  # 启用前缀共享
+        self.blocks = [Block(i, block_size) for i in range(num_blocks)]  # 根据设置的块数量分配块
+        self.hash_to_block_id:dict[int, int] = dict()  # 链式哈希对应的块，都是已满的块
+        self.free_blocks_idx:deque[int] = deque(range(num_blocks))  # 生成1-num_blocks的整数序列，表示哪些块还未分配
+        self.used_blocks_idx:set[int] = set()  # 哪些块已被使用
+
+        # 分配kv_cache
+        # 形状: [num_blocks, block_size, 2(key和value), num_layers, num_heads, head_dim]
+        self.kv_cache = torch.zeros(
+            num_blocks, block_size, 2, num_layers, num_heads, head_dim,
+            dtype=dtype, device=device
+        )
+
+    def set_kv(self, block_id, offset, layer, k, v):
+        """写入 KV 到指定块的位置， offset为块内偏移，即第几个token"""
+        # k, v 形状: [num_heads, head_dim]
+        self.kv_cache[block_id, offset, 0, layer] = k
+        self.kv_cache[block_id, offset, 1, layer] = v
+
+    def get_kv(self, block_id, offset, layer):
+        """从指定块位置取出已经计算好的k和v,offset为块内偏移，即第几个token"""
+        # k, v 形状: [num_heads, head_dim]
+        k = self.kv_cache[block_id, offset, 0, layer]
+        v = self.kv_cache[block_id, offset, 1, layer]
+        return k, v
+
+
+    # 按批分配
+    def allocate_block(self, num_blocks):
+        assert num_blocks <= len(self.free_blocks_idx)
+        allocate_idx = []  # 储存id
+        for i in range(num_blocks):
+            block_idx = self.free_blocks_idx.popleft()  #移除
+            self.used_blocks_idx.add(block_idx)
+            self.blocks[block_idx].ref_count = 1
+            allocate_idx.append(block_idx)
+        return allocate_idx
+
+    # 按批释放
+    def free_block(self, block_ids):
+        """
+        block_ids表示需要释放的块的索引，为链表
+        """
+        for idx in block_ids:
+            assert self.num_blocks > idx >= 0
+            assert idx in self.used_blocks_idx
+            self.blocks[idx].reset()
+            self.free_blocks_idx.appendleft(idx)
+            self.used_blocks_idx.discard(idx)
+
+    def compute_hash(self, token_ids, prev_hash=-1):
+        """
+        依据新传入的token序列更新链式hash，针对的是一个token_ids
+        """
+        h = xxhash.xxh64()  # 哈希对象
+        if prev_hash != -1:
+            # 一开始的8字节是为了防止对已有的prev_hash进行截断
+            h.update(prev_hash.to_bytes(8, "little"))  # 把整数转换为 8 字节的二进制数据, "little"：小端序(Little Endian)
+        for idx in token_ids:
+            # 对于新加入的每个token，4字节足矣
+            h.update(idx.to_bytes(4, "little"))
+        return h.intdigest()
+
+    def allocate_with_prefix(self, seq: Sequence):
+        """
+        传入的是一个seq类
+        复用block，查看前缀block，一旦发生cache_miss,则后续全部分配新block
+        """
+        prev_hash = -1
+        cache_miss = False
+        physical_blocks = []
+        token_ids = seq.token_ids  # 取出 token 列表
+        # token_ids 是 List[int]，形状是 [seq_len]
+        # 例如: [1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+        # 计算前缀数组，一旦cachemiss则后续全部新分配
+        for i in range(0, len(token_ids), self.block_size):
+            block_tokens = token_ids[i: i+self.block_size]  # 以block_size为单位进行切片，若最后一个块不满，会自动切片，只填入剩余的idx
+            is_full = len(block_tokens) == self.block_size
+            if not is_full:
+                current_hash = -1
+            else:
+                # 以块的token为单位进行更新
+                current_hash = self.compute_hash(block_tokens, prev_hash)
+
+            # 尝试复用已分配的block
+            # 先从哈希表获取，观察是否命中已有block(特殊判断：若命中，查看储存的token是否真的一致)
+            block_id = self.hash_to_block_id.get(current_hash, -1)
+            if block_id == -1 or self.blocks[block_id].token_ids!= block_tokens:
+                cache_miss = True
+
+            if cache_miss:
+                new_idx = self.free_blocks_idx.popleft()
+                self.used_blocks_idx.add(new_idx)
+                physical_blocks.append(new_idx)
+                self.blocks[new_idx].ref_count = 1
+
+                # 如果是完整块，注册到哈希表
+                if is_full:
+                    self.blocks[new_idx].ref_count = 1
+                    self.hash_to_block_id[current_hash] = new_idx
+            # 复用已有块
+            else:
+                seq.num_cached_tokens += self.block_size
+                self.blocks[block_id].ref_count += 1  # 根据block_id复用已有的块
+                physical_blocks.append(block_id)
+            # 若当前块已满，更新prev_hash，用于下一轮计算
+            if is_full:
+                prev_hash = current_hash
+
+        # 记录当前序列分配到的所有物理块 ID
+        seq.block_table = physical_blocks
+        return physical_blocks
+
+
+
