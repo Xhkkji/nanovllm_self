@@ -13,4 +13,4 @@ class Config:
     gpu_memory_utilization: float = 0.9
     max_num_batched_tokens: int = 256
     kvcache_block_size: int = 256
-    use_cache: bool = False
+    use_cache: bool = True

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from nanovllm_self.nanovllm.layers.attention import PagedAttention
+from .attention import PagedAttention
 from transformers import AutoModelForCausalLM
 
 

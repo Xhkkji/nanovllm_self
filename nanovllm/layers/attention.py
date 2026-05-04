@@ -35,7 +35,8 @@ class PagedAttention(nn.Module):
         for block_idx, block_id in enumerate(block_table):
             start = block_idx * block_size
             end = min(start+block_size, num_tokens)  # 避免最后不满的块越界
-            for offset in range(start, end):
+            for offset_global in range(start, end):
+                offset = offset_global % block_size  # 块内偏移
                 k, v = block_manager.get_kv(block_id, offset, layer)  # layer不可省略
                 all_k.append(k)  # [num_heads, head_dim]
                 all_v.append(v)  # [num_heads, head_dim]

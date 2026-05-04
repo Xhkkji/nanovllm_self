@@ -3,7 +3,7 @@ from typing import List, Tuple
 import xxhash
 import torch
 
-from nanovllm_self.nanovllm.engine.Sequence import Sequence
+from .Sequence import Sequence
 
 engine_config = {
     "enable_prefix_caching": True,  # 启用前缀共享
@@ -26,7 +26,7 @@ class Block:
 
     def update(self, h: int, token_ids: List[int], prev_hash):
         self.hash = h
-        self.token_ids = token_ids.copy
+        self.token_ids = token_ids.copy()
         self.prev_hash = prev_hash
 
     def reset(self):
@@ -36,7 +36,7 @@ class Block:
         self.prev_hash = -1
 
 class block_manager:
-    def __init__(self, num_blocks=1024, block_size=32, num_layers=32, num_heads=32, head_dim=128, enable_prefix_cache=False, dtype=torch.bfloat16, device='cuda:0'):
+    def __init__(self, num_blocks=1024, block_size=32, num_layers=32, num_kv_heads=32, head_dim=128, enable_prefix_cache=False, dtype=torch.bfloat16, device='cuda:0'):
         """
         总共 4096 个块
         每个块4个token
@@ -50,21 +50,55 @@ class block_manager:
         self.used_blocks_idx:set[int] = set()  # 哪些块已被使用
 
         # 分配kv_cache
-        # 形状: [num_blocks, block_size, 2(key和value), num_layers, num_heads, head_dim]
+        # 形状: [num_blocks, block_size, 2(key和value), num_layers, num_kv_heads, head_dim]
         self.kv_cache = torch.zeros(
-            num_blocks, block_size, 2, num_layers, num_heads, head_dim,
+            num_blocks, block_size, 2, num_layers, num_kv_heads, head_dim,
             dtype=dtype, device=device
         )
 
     def set_kv(self, block_id, offset, layer, k, v):
         """写入 KV 到指定块的位置， offset为块内偏移，即第几个token"""
-        # k, v 形状: [num_heads, head_dim]
+        # k, v 形状: [num_kv_heads, head_dim]
         self.kv_cache[block_id, offset, 0, layer] = k
         self.kv_cache[block_id, offset, 1, layer] = v
+    
+    def set_kv_prefill(self, k, v, seq, layer):
+        """
+        prefill阶段一次性存储所有token的kv
+        k, v 形状: [batch, seq_len, num_kv_heads, head_dim]
+        """
+        # seq.token_ids.shape=torch.Size([1, token_len])
+        # print(f"seq.token_ids:{seq.token_ids}")
+        token_ids = seq.token_ids  # 取出 token 列表
+        block_table = seq.block_table
+
+        for token_idx in range(len(token_ids)):
+            block_idx = token_idx // self.block_size
+            block_id = block_table[block_idx]  # 取出对应的真实物理块id
+            offset = token_idx % self.block_size
+            self.set_kv(block_id, offset, layer, k[0, token_idx], v[0, token_idx])
+                
+
+        # batch, seq_len, num_kv_heads, head_dim = k_raw.shape
+        # assert batch == 1  # 目前仅支持 batch_size=1 的 prefill
+
+        # block_size = self.block_size
+        # token_ids = seq.token_ids  # [seq_len]
+        # block_table = seq.block_table  # [num_blocks]
+
+        # for i in range(0, seq_len, block_size):
+        #     block_idx = i // block_size
+        #     block_id = block_table[block_idx]
+        #     offset = 0
+        #     for j in range(i, min(i + block_size, seq_len)):
+        #         k = k_raw[0, j]  # [num_kv_heads, head_dim]
+        #         v = v_raw[0, j]  # [num_kv_heads, head_dim]
+        #         self.set_kv(block_id, offset, layer, k, v)
+        #         offset += 1
 
     def get_kv(self, block_id, offset, layer):
         """从指定块位置取出已经计算好的k和v,offset为块内偏移，即第几个token"""
-        # k, v 形状: [num_heads, head_dim]
+        # k, v 形状: [num_kv_heads, head_dim]
         k = self.kv_cache[block_id, offset, 0, layer]
         v = self.kv_cache[block_id, offset, 1, layer]
         return k, v
@@ -106,18 +140,19 @@ class block_manager:
             h.update(idx.to_bytes(4, "little"))
         return h.intdigest()
 
-    def allocate_with_prefix(self, seq: Sequence):
+    def allocate_with_prefill(self, seq: Sequence):
         """
-        传入的是一个seq类
+        传入的是一个seq类，在prefill阶段直接分配块
         复用block，查看前缀block，一旦发生cache_miss,则后续全部分配新block
         """
         prev_hash = -1
         cache_miss = False
         physical_blocks = []
+        
         token_ids = seq.token_ids  # 取出 token 列表
         # token_ids 是 List[int]，形状是 [seq_len]
         # 例如: [1, 2, 3, 4, 5, 6, 7, 8, 9]
-
+        # print(f"[Debug] allocate_with_prefill: Allocating blocks for tokens: {token_ids}")  # 添加调试输出，查看输入的 token 列表
         # 计算前缀数组，一旦cachemiss则后续全部新分配
         for i in range(0, len(token_ids), self.block_size):
             block_tokens = token_ids[i: i+self.block_size]  # 以block_size为单位进行切片，若最后一个块不满，会自动切片，只填入剩余的idx

@@ -5,7 +5,7 @@ from transformers import AutoModelForCausalLM
 # from ..layers.transformer_layer import TransformerLayer
 from tqdm import tqdm
 from transformers import AutoConfig
-from nanovllm_self.nanovllm.layers.attention import PagedAttention
+from ..layers.attention import PagedAttention
 
 class QwenDecoderLayer(nn.Module):
     def __init__(self, layer_id, hidden_size, intermediate_size, num_heads, num_kv_heads, head_dim, dtype=torch.bfloat16):
@@ -41,6 +41,52 @@ class QwenDecoderLayer(nn.Module):
         # PagedAttention
         self.p_attn = PagedAttention(num_heads, self.num_kv_heads, self.head_dim)
 
+    def prefill(self, x, block_manager, seq):
+        """
+        prefill阶段一次性处理整个输入序列，计算并存储所有的kv
+        x与seq对应，seq会记录哪些token的kv已经存储过了（通过num_cached_tokens），避免重复计算
+        但是seq在prefill阶段不做修改
+        """
+        x = x.unsqueeze(0)  # [1, token_len, hidden_size]，添加batch维度，方便统一处理
+        residual = x
+        x = self.ln1(x)
+        # x.shape: [1, token_len, hidden_size]
+        batch, seq_len, encode_dim = x.shape
+        # x = x.view(batch * seq_len, encode_dim)  # 展平为[batch*seq_len, hidden_size]，一次性投影所有token
+        q = self.q_proj(x).view(batch, seq_len, self.num_heads, self.head_dim)  # [batch, seq_len, num_heads, head_dim]
+        k = self.k_proj(x).view(batch, seq_len, self.num_kv_heads, self.head_dim)  # [batch, seq_len, num_kv_heads, head_dim]
+        v = self.v_proj(x).view(batch, seq_len, self.num_kv_heads, self.head_dim)  # [batch, seq_len, num_kv_heads, head_dim]
+
+        block_manager.set_kv_prefill(k, v, seq, self.layer_id)  # prefill阶段一次性存储所有token的kv
+
+        if self.num_heads != self.num_kv_heads:
+            # GQA 复制 KV 头以匹配 Q 头数
+            groups = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(groups, dim=2)  # [batch, seq_len, num_heads, head_dim]
+            v = v.repeat_interleave(groups, dim=2)  # [batch, seq_len, num_heads, head_dim]
+        q = q.permute(0, 2, 1, 3)  # [batch, num_heads, seq_len, head_dim]
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)  # [batch, num_heads, seq_len, seq_len]
+        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=scores.device), diagonal=1).bool()
+        scores = scores.masked_fill(causal_mask, float('-inf'))
+        # print(f"[DEBUG] prefill: scores={scores}")
+        attn_weights = F.softmax(scores, dim=-1)  # [batch, num_heads, seq_len, seq_len]
+        attn_output = torch.matmul(attn_weights, v)  # [batch, num_heads, seq_len, head_dim]
+        attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(batch, seq_len, self.num_heads * self.head_dim)  # [batch, seq_len, hidden_size]
+        attn_output = self.o_proj(attn_output)  # [batch, seq_len
+        x = attn_output + residual  # 残差连接
+
+        residual = x
+        x = self.ln2(x)
+        # SwiGLU
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        x = F.silu(gate) * up
+        x = self.down_proj(x)
+        x = residual + x
+        x = x.squeeze(0)
+        return x
 
 
     def forward(self, x, block_manager, seq, is_prefill=False):
@@ -70,10 +116,11 @@ class QwenDecoderLayer(nn.Module):
         x = self.down_proj(x)
         x = residual + x
         return x
+
 class Qwen3Model(nn.Module):
-    def __init__(self, num_layers, hidden_size, num_heads, head_dim, vocab_size):
+    def __init__(self, config):
         super().__init__()
-        config = AutoConfig.from_pretrained("/home/xhk/model/Qwen3-0.6B/")
+        # config = AutoConfig.from_pretrained("/home/xhk/model/Qwen3-0.6B/")
         self.dtype = torch.bfloat16
         self.num_layers = config.num_hidden_layers
         self.hidden_size = config.hidden_size
@@ -84,18 +131,18 @@ class Qwen3Model(nn.Module):
         self.intermediate_size = config.intermediate_size
         self.num_kv_heads = config.num_key_value_heads
 
-        self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
+        self.embed_tokens = nn.Embedding(self.vocab_size, self.hidden_size)
 
         # Transformer
         self.layers = nn.ModuleList([
             QwenDecoderLayer(i, self.hidden_size, self.intermediate_size, self.num_heads, self.num_kv_heads, self.head_dim, self.dtype)
-            for i in range(num_layers)
+            for i in range(self.num_layers)
         ])
 
         # 最后一次的层归一化
-        self.norm = nn.LayerNorm(hidden_size, dtype=self.dtype)
+        self.norm = nn.LayerNorm(self.hidden_size, dtype=self.dtype)
         # 最后的线性层，映射到词汇表每个单词的概率
-        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False, dtype=self.dtype)
+        self.lm_head = nn.Linear(self.hidden_size, self.vocab_size, bias=False, dtype=self.dtype)
 
         self.load_pretrain_weights()
 
@@ -104,7 +151,7 @@ class Qwen3Model(nn.Module):
         pretrained = AutoModelForCausalLM.from_pretrained(
             model,
             # torch_dtype=torch.float16,
-            device_map="cpu")
+            device_map="cuda:0")
         pretrained_layers = pretrained.model.layers
 
         for i, layer in tqdm(enumerate(self.layers)):
@@ -146,25 +193,36 @@ class Qwen3Model(nn.Module):
         print("✅ Weight loading completed!")
 
 
-    def forward(self, token_ids, positions, block_manager, seq):
+    def forward(self, token_ids, positions, block_manager, seq, is_prefill=False):
         """
             token_ids: [num_tokens] 当前要处理的 token
             positions: [num_tokens] 位置编码（可选）
         """
 
         x = self.embed_tokens(token_ids)  # [num_tokens, hidden_size]
-        print(f"[DEBUG] forward: self.hidden_size={self.hidden_size}")
-        print(f"[DEBUG] forward: x.shape={x.shape}")
+        # print(f"[DEBUG] forward: self.hidden_size={self.hidden_size}")
+        # print(f"[DEBUG] forward: x.shape={x.shape}")
 
-        if token_ids.dim() == 1 and token_ids.size(0) == 1:  # 一维张量且只有一个元素
-            x = x.squeeze(0)  # [1, hidden_size] -> [hidden_size], 去掉batch维度
+        # if token_ids.dim() == 1 and token_ids.size(0) == 1:  # 一维张量且只有一个元素
+        if not is_prefill:
+            if x.dim() == 2:
+                x = x.squeeze(0)  # [1, hidden_size] -> [hidden_size], 去掉token_len维度
             for layer in self.layers:
                 x = layer.forward(x, block_manager, seq)  # Transformer前向过程中保存了kv
+            # x.shape=torch.Size([1024])
+            # print(f"[DEBUG] decode forward: after layers, x.shape={x.shape}")
+        
         else:
             # prefill
-            pass
-
+            # x.shape:torch.Size([1, token_len, 1024])
+            print(f"prefill..")
+            for layer in self.layers:
+                x = layer.prefill(x, block_manager, seq)
+            # x.shape=torch.Size([11, 1024])
+            # print(f"[DEBUG] prefill forward: after layers, x.shape={x.shape}")
+        
         x = self.norm(x)
         logits = self.lm_head(x)
+        # 此处没有batch维度
         return logits
 

@@ -9,31 +9,34 @@ def test():
     print("开始测试 Qwen3Model")
     print("=" * 50)
 
-    config = AutoConfig.from_pretrained("/home/xhk/model/Qwen3-0.6B/")
+    model_config = AutoConfig.from_pretrained("/home/xhk/model/Qwen3-0.6B/")
     # 1. 配置参数（匹配 Qwen3-0.6B）
-    num_layers = config.num_hidden_layers
-    hidden_size = config.hidden_size
-    num_heads = config.num_attention_heads
-    num_kv_heads = config.num_key_value_heads
-    head_dim = hidden_size // num_kv_heads
-    vocab_size = config.vocab_size
+    # num_layers = config.num_hidden_layers
+    # hidden_size = config.hidden_size
+    # num_heads = config.num_attention_heads
+    # num_kv_heads = config.num_key_value_heads
+    # head_dim = hidden_size // num_kv_heads
+    # vocab_size = config.vocab_size
 
     print(f"\n配置:")
-    print(f"  层数: {num_layers}")
-    print(f"  隐藏层大小: {hidden_size}")
-    print(f"  注意力头数: {num_heads}")
-    print(f"  头维度: {head_dim}")
-    print(f"  词表大小: {vocab_size}")
+    print(f"  层数: {model_config.num_hidden_layers}")
+    print(f"  隐藏层大小: {model_config.hidden_size}")
+    print(f"  注意力头数: {model_config.num_attention_heads}")
+    print(f"  头维度: {model_config.hidden_size // model_config.num_key_value_heads}")
+    print(f"  词表大小: {model_config.vocab_size}")
 
     # 2. 创建模型
     print("\n创建模型...")
-    model = Qwen3Model(
-        num_layers=num_layers,
-        hidden_size=hidden_size,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        vocab_size=vocab_size
-    )
+    # model_config = AutoConfig.from_pretrained("/home/xhk/model/Qwen3-0.6B/")
+    model = Qwen3Model(model_config)
+    # model = Qwen3Model(
+    #     num_layers=num_layers,
+    #     hidden_size=hidden_size,
+    #     num_heads=num_heads,
+    #     num_kv_heads=num_kv_heads,
+    #     head_dim=head_dim,
+    #     vocab_size=vocab_size
+    # )
     model.cuda()
     model.eval()
     print("✅ 模型创建成功")
@@ -43,9 +46,9 @@ def test():
     block_manager = bm(
         num_blocks=100,
         block_size=16,
-        num_layers=num_layers,
-        num_heads=num_kv_heads,
-        head_dim=head_dim
+        num_layers=model_config.num_hidden_layers,
+        num_kv_heads=model_config.num_key_value_heads,
+        head_dim=model_config.hidden_size // model_config.num_key_value_heads
     )
     print("✅ BlockManager 创建成功")
 
@@ -56,7 +59,7 @@ def test():
     seq.block_size = 16  # 添加 block_size 属性
 
     # 分配块
-    seq.block_table = block_manager.allocate_with_prefix(seq)
+    seq.block_table = block_manager.allocate_with_prefill(seq)
     print(f"  Prompt tokens: {prompt_tokens}")
     print(f"  Block table: {seq.block_table}")
     print(f"  使用块数: {len(seq.block_table)}")

@@ -3,6 +3,7 @@
 class Sequence:
     """
     序列类，代表一个推理请求
+    一个Sequence实例对应一个batch，多batch对应多个sequence实例
     """
     def __init__(self, seq_idx, token_ids):
         self.seq_idx = seq_idx  # 序列id，整个token的ids
