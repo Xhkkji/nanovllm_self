@@ -6,6 +6,7 @@ from transformers import AutoModelForCausalLM
 from tqdm import tqdm
 from transformers import AutoConfig
 from ..layers.attention import PagedAttention
+from ..layers.RMSNorm import RMSNorm
 
 class QwenDecoderLayer(nn.Module):
     def __init__(self, layer_id, hidden_size, intermediate_size, num_heads, num_kv_heads, head_dim, dtype=torch.bfloat16):
@@ -35,8 +36,10 @@ class QwenDecoderLayer(nn.Module):
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False, dtype=dtype)
 
         # layernorm
-        self.ln1 = nn.LayerNorm(hidden_size, dtype=dtype)
-        self.ln2 = nn.LayerNorm(hidden_size, dtype=dtype)
+        # self.ln1 = nn.LayerNorm(hidden_size, dtype=dtype)
+        # self.ln2 = nn.LayerNorm(hidden_size, dtype=dtype)
+        self.ln1 = RMSNorm(hidden_size, dtype=dtype)
+        self.ln2 = RMSNorm(hidden_size, dtype=dtype)
 
         # PagedAttention
         self.p_attn = PagedAttention(num_heads, self.num_kv_heads, self.head_dim)
