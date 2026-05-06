@@ -174,6 +174,8 @@ class block_manager:
                 self.used_blocks_idx.add(new_idx)
                 physical_blocks.append(new_idx)
                 self.blocks[new_idx].ref_count = 1
+                # 更新块状态
+                self.blocks[new_idx].update(current_hash, block_tokens, prev_hash)
 
                 # 如果是完整块，注册到哈希表
                 if is_full:

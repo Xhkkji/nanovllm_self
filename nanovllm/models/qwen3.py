@@ -7,9 +7,10 @@ from tqdm import tqdm
 from transformers import AutoConfig
 from ..layers.attention import PagedAttention
 from ..layers.RMSNorm import RMSNorm
+from ..layers.RoPE import RotaryEmbedding
 
 class QwenDecoderLayer(nn.Module):
-    def __init__(self, layer_id, hidden_size, intermediate_size, num_heads, num_kv_heads, head_dim, dtype=torch.bfloat16):
+    def __init__(self, layer_id, hidden_size, intermediate_size, num_heads, num_kv_heads, head_dim, config, dtype=torch.bfloat16):
         super().__init__()
         """
         layer_id: 推理时要经过很多层transformer block，每一层的kv都不一样，所以每一层的kv都需要存储
@@ -19,6 +20,7 @@ class QwenDecoderLayer(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads
+        self.config = config
 
         # 权重在总模型中赋值
         # kqv线性投影矩阵
@@ -38,13 +40,17 @@ class QwenDecoderLayer(nn.Module):
         # layernorm
         # self.ln1 = nn.LayerNorm(hidden_size, dtype=dtype)
         # self.ln2 = nn.LayerNorm(hidden_size, dtype=dtype)
-        self.ln1 = RMSNorm(hidden_size, dtype=dtype)
-        self.ln2 = RMSNorm(hidden_size, dtype=dtype)
+        self.ln1 = RMSNorm(hidden_size, dtype=dtype, eps=self.config.rms_norm_eps)
+        self.ln2 = RMSNorm(hidden_size, dtype=dtype, eps=self.config.rms_norm_eps)
+        # 控制注意力分数的方差，防止梯度消失或爆炸，在计算出kqv之后、RoPE操作之前使用
+        self.q_norm = RMSNorm(self.head_dim, dtype=dtype, eps=self.config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, dtype=dtype, eps=self.config.rms_norm_eps)
+
 
         # PagedAttention
         self.p_attn = PagedAttention(num_heads, self.num_kv_heads, self.head_dim)
 
-    def prefill(self, x, block_manager, seq):
+    def prefill(self, x, block_manager, seq, positions, rotary_embedding):
         """
         prefill阶段一次性处理整个输入序列，计算并存储所有的kv
         x与seq对应，seq会记录哪些token的kv已经存储过了（通过num_cached_tokens），避免重复计算
@@ -59,6 +65,12 @@ class QwenDecoderLayer(nn.Module):
         q = self.q_proj(x).view(batch, seq_len, self.num_heads, self.head_dim)  # [batch, seq_len, num_heads, head_dim]
         k = self.k_proj(x).view(batch, seq_len, self.num_kv_heads, self.head_dim)  # [batch, seq_len, num_kv_heads, head_dim]
         v = self.v_proj(x).view(batch, seq_len, self.num_kv_heads, self.head_dim)  # [batch, seq_len, num_kv_heads, head_dim]
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        # 旋转位置编码
+        q, k = rotary_embedding(positions, q, k)
 
         block_manager.set_kv_prefill(k, v, seq, self.layer_id)  # prefill阶段一次性存储所有token的kv
 
@@ -92,13 +104,25 @@ class QwenDecoderLayer(nn.Module):
         return x
 
 
-    def forward(self, x, block_manager, seq, is_prefill=False):
+    def forward(self, x, block_manager, seq, positions, rotary_embedding, is_prefill=False):
         residual = x
         x = self.ln1(x)
 
         q = self.q_proj(x).view(self.num_heads, self.head_dim)  # [2048]
         k = self.k_proj(x).view(self.num_kv_heads, self.head_dim)  # [1024]
         v = self.v_proj(x).view(self.num_kv_heads, self.head_dim)  # [1024]
+        # [Debug] decode: q.shape:torch.Size([16, 128]), k.shapetorch.Size([8, 128])
+        # print(f"[Debug] decode: q.shape:{q.shape}, k.shape{k.shape}")
+        
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+
+        q = q.unsqueeze(0).unsqueeze(0)
+        k = k.unsqueeze(0).unsqueeze(0)
+        q, k = rotary_embedding(positions, q, k)
+        q = q.squeeze(0).squeeze(0)
+        k = k.squeeze(0).squeeze(0)
 
         token_pos = len(seq.token_ids) - 1  # 传入的seq是动态增长的
         block_idx = token_pos // block_manager.block_size  # 算出最后一个token属于哪个块
@@ -136,14 +160,21 @@ class Qwen3Model(nn.Module):
 
         self.embed_tokens = nn.Embedding(self.vocab_size, self.hidden_size)
 
+        # RoPE
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rotary_dim = self.head_dim
+        rope_theta = getattr(config, "rope_theta", 1000000.0)
+        self.rotary_embedding = RotaryEmbedding(self.head_dim, self.rotary_dim, self.max_position_embeddings, rope_theta)
+
         # Transformer
         self.layers = nn.ModuleList([
-            QwenDecoderLayer(i, self.hidden_size, self.intermediate_size, self.num_heads, self.num_kv_heads, self.head_dim, self.dtype)
+            QwenDecoderLayer(i, self.hidden_size, self.intermediate_size, self.num_heads, self.num_kv_heads, self.head_dim, config, self.dtype)
             for i in range(self.num_layers)
         ])
 
         # 最后一次的层归一化
-        self.norm = nn.LayerNorm(self.hidden_size, dtype=self.dtype)
+        # self.norm = nn.LayerNorm(self.hidden_size, dtype=self.dtype)
+        self.norm = RMSNorm(self.hidden_size, dtype=self.dtype)
         # 最后的线性层，映射到词汇表每个单词的概率
         self.lm_head = nn.Linear(self.hidden_size, self.vocab_size, bias=False, dtype=self.dtype)
 
@@ -188,10 +219,16 @@ class Qwen3Model(nn.Module):
             if hasattr(layer.ln1, 'weight'):
                 layer.ln1.weight.data = pretrained_layers[i].input_layernorm.weight.data
                 layer.ln2.weight.data = pretrained_layers[i].post_attention_layernorm.weight.data
+            
+            layer.q_norm.weight.data = pretrained_layers[i].self_attn.q_norm.weight.data
+            layer.k_norm.weight.data = pretrained_layers[i].self_attn.k_norm.weight.data
+
 
         # 复制 embedding 和 lm_head
         self.embed_tokens.weight.data = pretrained.model.embed_tokens.weight.data
         self.lm_head.weight.data = pretrained.lm_head.weight.data
+        # RMSNorm赋值
+        self.norm.weight.data = pretrained.model.norm.weight.data
 
         print("✅ Weight loading completed!")
 
@@ -211,7 +248,7 @@ class Qwen3Model(nn.Module):
             if x.dim() == 2:
                 x = x.squeeze(0)  # [1, hidden_size] -> [hidden_size], 去掉token_len维度
             for layer in self.layers:
-                x = layer.forward(x, block_manager, seq)  # Transformer前向过程中保存了kv
+                x = layer.forward(x, block_manager, seq, positions=positions, rotary_embedding=self.rotary_embedding)  # Transformer前向过程中保存了kv
             # x.shape=torch.Size([1024])
             # print(f"[DEBUG] decode forward: after layers, x.shape={x.shape}")
         
@@ -220,7 +257,7 @@ class Qwen3Model(nn.Module):
             # x.shape:torch.Size([1, token_len, 1024])
             print(f"prefill..")
             for layer in self.layers:
-                x = layer.prefill(x, block_manager, seq)
+                x = layer.prefill(x, block_manager, seq, positions=positions, rotary_embedding=self.rotary_embedding)
             # x.shape=torch.Size([11, 1024])
             # print(f"[DEBUG] prefill forward: after layers, x.shape={x.shape}")
         

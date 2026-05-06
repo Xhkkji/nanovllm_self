@@ -127,13 +127,14 @@ class llm_engine_self():
       with torch.no_grad():
         if is_prefill:
           current_tokens = all_tokens[0]  # prefill阶段输入整个序列，current_tokens为[seq_len]
-          outputs = self.model(current_tokens, positions=None, block_manager=block_manager, seq=seq, is_prefill=True)
+          positions = torch.arange(0, len(seq.token_ids), device=self.config.device).unsqueeze(0)
+          outputs = self.model(current_tokens, positions=positions, block_manager=block_manager, seq=seq, is_prefill=True)
           outputs_logits = outputs[-1, :].unsqueeze(0)  # [batch, token_len, vocab_dim]
           is_prefill = False
         else:
           current_tokens = all_tokens[0, -1:]  # 取最后一个token
           # outputs:(token_num, vocab_len)
-          outputs = self.model(current_tokens, positions=None, block_manager=block_manager, seq=seq, is_prefill=False)
+          outputs = self.model(current_tokens, positions=torch.tensor([[len(seq.token_ids)-1]], device=self.config.device), block_manager=block_manager, seq=seq, is_prefill=False)
           outputs_logits = outputs.unsqueeze(0)  # [batch, token_len, vocab_dim]
 
         # outputs.logits.shape:batchsize, seq_len, vocab_size
@@ -167,4 +168,4 @@ class llm_engine_self():
     return all_tokens
 
   def decode(self, all_tokens):
-    return self.tokenizer.decode(all_tokens)
+    return self.tokenizer.decode(all_tokens[0], skip_special_tokens=True)
