@@ -10,6 +10,9 @@ class RMSNorm(nn.Module):
 
     def forward(self, x):
         # 计算RMS
-        rms = torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        x_fp32 = x.float()
+        weight_fp32 = self.weight.float()
+        rms = torch.sqrt(x_fp32.pow(2).mean(-1, keepdim=True) + self.eps)
         # 应用RMSNorm
-        return self.weight * x / rms
+        out = weight_fp32 * x_fp32 / rms
+        return out.to(x.dtype)

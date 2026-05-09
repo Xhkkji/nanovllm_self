@@ -102,7 +102,29 @@ class block_manager:
         k = self.kv_cache[block_id, offset, 0, layer]
         v = self.kv_cache[block_id, offset, 1, layer]
         return k, v
+    
+    def get_kv_block(self, seq, layer):
+        """
+        每次decode过程直接成批地取出上文的kv
+        kvcache形状：[num_blocks, block_size, 2, num_layers, num_kv_heads, head_dim]
+        """
+        block_size = self.block_size
+        block_table = seq.block_table
+        num_tokens = len(seq.token_ids)  # 该seq的token的总数
 
+        # print(f'block_table:{block_table}')
+        # 收集所有的kv
+        k_blocks = self.kv_cache[block_table, :, 0, layer, :, :]
+        # [num_seq, block_size, num_kv_heads, head_dim] -> [seq_len, num_kv_heads, head_dim]
+        all_k = k_blocks.reshape(-1, self.kv_cache.shape[-2], self.kv_cache.shape[-1])
+        # 截去未满块的空白内容
+        all_k = all_k[:num_tokens]
+        v_blocks = self.kv_cache[block_table, :, 1, layer, :, :]
+        all_v = v_blocks.reshape(-1, self.kv_cache.shape[-2], self.kv_cache.shape[-1])
+        all_v = all_v[:num_tokens]
+        # print(f"all_k:{all_k}")
+        # print(f"all_v:{all_v}")
+        return all_k, all_v
 
     # 按批分配
     def allocate_block(self, num_blocks):
@@ -115,17 +137,24 @@ class block_manager:
             allocate_idx.append(block_idx)
         return allocate_idx
 
-    # 按批释放
+    # 根据传入的block_table批量释放block
     def free_block(self, block_ids):
         """
         block_ids表示需要释放的块的索引，为链表
         """
+
         for idx in block_ids:
             assert self.num_blocks > idx >= 0
             assert idx in self.used_blocks_idx
+            block_hash = self.blocks[idx].hash
+            # 释放哈希列表
+            if block_hash != -1 and self.hash_to_block_id.get(block_hash) == idx:
+                del self.hash_to_block_id[block_hash]
+
             self.blocks[idx].reset()
             self.free_blocks_idx.appendleft(idx)
             self.used_blocks_idx.discard(idx)
+            
 
     def compute_hash(self, token_ids, prev_hash=-1):
         """

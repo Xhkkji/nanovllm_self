@@ -29,37 +29,40 @@ class PagedAttention(nn.Module):
         block_table = seq.block_table
         num_tokens = len(seq.token_ids)  # 该seq的token的总数
         # 收集所有的kv
-        all_k = []
-        all_v = []
+        all_k, all_v = block_manager.get_kv_block(seq, layer)
+        dtype = all_k.dtype
 
-        for block_idx, block_id in enumerate(block_table):
-            start = block_idx * block_size
-            end = min(start+block_size, num_tokens)  # 避免最后不满的块越界
-            for offset_global in range(start, end):
-                offset = offset_global % block_size  # 块内偏移
-                k, v = block_manager.get_kv(block_id, offset, layer)  # layer不可省略
-                all_k.append(k)  # [num_heads, head_dim]
-                all_v.append(v)  # [num_heads, head_dim]
+        # all_k = []
+        # all_v = []
+        # for block_idx, block_id in enumerate(block_table):
+        #     start = block_idx * block_size
+        #     end = min(start+block_size, num_tokens)  # 避免最后不满的块越界
+        #     for offset_global in range(start, end):
+        #         offset = offset_global % block_size  # 块内偏移
+        #         k, v = block_manager.get_kv(block_id, offset, layer)  # layer不可省略
+        #         all_k.append(k)  # [num_heads, head_dim]
+        #         all_v.append(v)  # [num_heads, head_dim]
+        # # 把列表在第一个维度堆叠起来
+        # # 堆叠成连续序列
+        # # all_k: [seq_len, num_kv_heads, head_dim]
+        # all_k = torch.stack(all_k, dim=0)
+        # # all_v: [seq_len, num_kv_heads, head_dim]
+        # all_v = torch.stack(all_v, dim=0)
 
-
-        # 把列表在第一个维度堆叠起来
-        # 堆叠成连续序列
-        # all_k: [seq_len, num_kv_heads, head_dim]
-        all_k = torch.stack(all_k, dim=0)
-        # all_v: [seq_len, num_kv_heads, head_dim]
-        all_v = torch.stack(all_v, dim=0)
-
-        # GQA: 复制 KV 头以匹配 Q 头数
+        # GQA: 复制 KV 头以匹配 Q 头数，待优化，可利用广播机制
         if self.num_heads != self.num_kv_heads:
             # [seq_len, num_kv_heads, head_dim] -> [seq_len, num_heads, head_dim]
             all_k = all_k.repeat_interleave(self.groups, dim=1)
             all_v = all_v.repeat_interleave(self.groups, dim=1)
 
+        all_k = all_k.float()
         all_k = all_k.permute(1, 2, 0)  # 含义: [heads, head_dim, seq_len]
+        all_v = all_v.float()
         all_v = all_v.permute(1, 0, 2)  # [num_heads, seq_len, head_dim]
 
         # attention计算
         # 把q unsqueeze成all_k的维度,[num_heads, head_dim] ->[1, num_heads, head_dim]
+        q = q.float()
         q = torch.unsqueeze(q, dim=0)
         # scores: [1, num_heads, seq_len]
         # 矩阵乘法，k取转置，除以缩放因子
@@ -73,6 +76,6 @@ class PagedAttention(nn.Module):
         # [1, num_heads, head_dim], attn_weight的最后一维和v的最后两维做点积运算,运用打分对v进行加权求和
         # output = torch.matmul(attn_weights, all_v)
         output = torch.einsum('bhs,hsd->bhd', attn_weights, all_v)
-        return output
+        return output.to(dtype)
 
 

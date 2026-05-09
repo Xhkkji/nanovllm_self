@@ -82,6 +82,7 @@ class QwenDecoderLayer(nn.Module):
         q = q.permute(0, 2, 1, 3)  # [batch, num_heads, seq_len, head_dim]
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
+
         scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)  # [batch, num_heads, seq_len, seq_len]
         causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=scores.device), diagonal=1).bool()
         scores = scores.masked_fill(causal_mask, float('-inf'))
@@ -89,7 +90,7 @@ class QwenDecoderLayer(nn.Module):
         attn_weights = F.softmax(scores, dim=-1)  # [batch, num_heads, seq_len, seq_len]
         attn_output = torch.matmul(attn_weights, v)  # [batch, num_heads, seq_len, head_dim]
         attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(batch, seq_len, self.num_heads * self.head_dim)  # [batch, seq_len, hidden_size]
-        attn_output = self.o_proj(attn_output)  # [batch, seq_len
+        attn_output = self.o_proj(attn_output)  # [batch, seq_len]
         x = attn_output + residual  # 残差连接
 
         residual = x
@@ -130,7 +131,7 @@ class QwenDecoderLayer(nn.Module):
         block_id = seq.block_table[block_idx]
         block_manager.set_kv(block_id, offset, self.layer_id, k, v)  # 一个层传入一次，按顺序与层数对应
 
-        attn_out = self.p_attn(q, block_manager, seq, self.layer_id)
+        attn_out = self.p_attn(q, block_manager, seq, self.layer_id)  # 内部已经利用精度提升计算了，返回的是原dtype
         attn_out = self.o_proj(attn_out.view(-1))  # 自动展成1维
         x = residual + attn_out
 
