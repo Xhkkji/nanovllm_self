@@ -136,7 +136,7 @@ class llm_engine_self():
             outputs_logits = outputs[-1, :].unsqueeze(0)  # [batch, token_len, vocab_dim]
             is_prefill = False
           else:
-            current_tokens = all_tokens[0, -1:]  # 取最后一个token
+            current_tokens = all_tokens[0, -1:]  # 取最后一🈶个token
             # outputs:(token_num, vocab_len)
             outputs = self.model(current_tokens, positions=torch.tensor([[len(seq.token_ids)-1]], device=self.config.device), block_manager=self.block_manager, seq=seq, is_prefill=False)
             outputs_logits = outputs.unsqueeze(0)  # [batch, token_len, vocab_dim]

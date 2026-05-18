@@ -19,10 +19,10 @@ class Block:
         self.block_id = block_id  # 分配好就不再修改
         self.block_size = block_size  # 分配好就不再修改
         self.ref_count = 0
-        self.hash = -1
+        self.hash = -1  # 只有当前块满的时候才会根据prev计算出当前块的hash
         self.token_ids = []
         self.ptr = None  # 指向GPU物理块的指针
-        self.prev_hash = -1
+        self.prev_hash = -1  # 除了第一个块以外一定有一个值，即上一个block的hash
 
     def update(self, h: int, token_ids: List[int], prev_hash):
         self.hash = h
@@ -55,6 +55,56 @@ class block_manager:
             num_blocks, block_size, 2, num_layers, num_kv_heads, head_dim,
             dtype=dtype, device=device
         )
+    
+    def can_allocate(self, seq:Sequence):
+        """
+        prefill阶段判断剩余空间够不够装下一整个seq
+        """
+        if (len(seq) + self.block_size - 1) // self.block_size > len(self.free_blocks_idx):
+            return False
+        else:
+            return True
+    
+    def can_append(self, seq:Sequence):
+        """
+        新token还未生成，只是检查预分配空间
+        检查是否够空间，不改变任何内部状态
+        decode阶段判断剩余空间够不够装下一个token,但是要考虑已有block未装满的情况
+        """
+        # 判断“是否将要或刚刚进入一个新的物理块
+        # 并且即使没有free_block了也不一定就不能append，因为可能有未满的已分配块
+        if (len(seq) % self.block_size == 1 and len(self.free_blocks_idx) >= 1) or seq.last_block_num_tokens != seq.block_size:
+            return True
+        else:
+            return False
+    
+    def may_append(self, seq:Sequence):
+        """
+        新token还未生成，只是预分配空间
+        实际分配block
+        """
+        # 由于是预分配，当余数为1时意味着新token恰好需要分配新块，为0意味着新token进入可以刚好装下
+        # 如果余数是2、3等，直接加入到未满的块即可，不需要新分配块
+        if len(seq) % self.block_size == 1:  # 判断“是否将要或刚刚进入一个新的物理块
+            new_block_id = self.allocate_block(1)[0]  # 引用计数已+1
+            last_block_id = seq.block_table[-1]
+            self.blocks[new_block_id].prev_hash = self.blocks[last_block_id].hash
+            seq.block_table.append(new_block_id)
+        elif len(seq) % self.block_size == 0:  # 装入后刚好块满，需要更新hash
+            last_block_id = seq.block_table[-1]
+            prev_block_id = seq.block_table[-2]
+            self.blocks[last_block_id].hash = self.compute_hash(self.blocks[last_block_id].token_ids, self.blocks[last_block_id].prev_hash)
+            self.hash_to_block_id[self.blocks[last_block_id].hash] = last_block_id
+        else:
+            last_block_id = seq.block_table[-1]
+            assert self.blocks[last_block_id].hash == -1  # 块未满，hash不赋值
+    
+    def allocate(self, seq:Sequence):
+        return self.allocate_with_prefill(seq)
+    
+    def deallocate(self, seq:Sequence):
+        self.free_blocks(seq.block_table)
+
 
     def set_kv(self, block_id, offset, layer, k, v):
         """写入 KV 到指定块的位置， offset为块内偏移，即第几个token"""
@@ -126,7 +176,7 @@ class block_manager:
         # print(f"all_v:{all_v}")
         return all_k, all_v
 
-    # 按批分配
+    # 按批分配，没有计算hash的过程，为block_manager初始化分配时使用的接口
     def allocate_block(self, num_blocks):
         assert num_blocks <= len(self.free_blocks_idx)
         allocate_idx = []  # 储存id
@@ -138,22 +188,23 @@ class block_manager:
         return allocate_idx
 
     # 根据传入的block_table批量释放block
-    def free_block(self, block_ids):
+    def free_blocks(self, block_ids):
         """
         block_ids表示需要释放的块的索引，为链表
         """
-
         for idx in block_ids:
             assert self.num_blocks > idx >= 0
             assert idx in self.used_blocks_idx
             block_hash = self.blocks[idx].hash
-            # 释放哈希列表
-            if block_hash != -1 and self.hash_to_block_id.get(block_hash) == idx:
-                del self.hash_to_block_id[block_hash]
+            self.blocks[idx].ref_count -= 1
+            if self.blocks[idx].ref_count == 0:
+                # 释放哈希列表
+                if block_hash != -1 and self.hash_to_block_id.get(block_hash) == idx:
+                    self.hash_to_block_id.pop(block_hash, None)
 
-            self.blocks[idx].reset()
-            self.free_blocks_idx.appendleft(idx)
-            self.used_blocks_idx.discard(idx)
+                self.blocks[idx].reset()
+                self.free_blocks_idx.appendleft(idx)
+                self.used_blocks_idx.discard(idx)
             
 
     def compute_hash(self, token_ids, prev_hash=-1):
