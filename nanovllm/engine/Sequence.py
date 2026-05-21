@@ -1,4 +1,5 @@
 from enum import Enum, auto
+import torch
 
 class SequenceStatus(Enum):
     WAITING = auto()
@@ -30,9 +31,9 @@ class Sequence:
 
     def append_token(self, token):
         """追加新生成的 token"""
-        self.token_ids.append(token)
+        self.token_ids = torch.cat((self.token_ids, token))
         self.token_len += 1
-        self.last_token = token
+        self.last_token = self.token_ids[-1]
 
     @property
     def num_blocks(self):

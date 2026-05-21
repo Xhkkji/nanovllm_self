@@ -36,9 +36,14 @@ class Stage1RegressionTest(unittest.TestCase):
             topk_ids = torch.topk(logits, k=k, dim=-1).indices[0].tolist()
         return topk_ids
 
+    def _num_blocks_for_case(self, input_ids, *, block_size, decode_steps=0, safety_margin=1):
+        total_tokens = input_ids.shape[1] + decode_steps
+        required_blocks = (total_tokens + block_size - 1) // block_size
+        return max(1, required_blocks + safety_margin)
+
     def _self_prefill_topk(self, input_ids, block_size=16, k=10):
         bm = BlockManager(
-            num_blocks=100,
+            num_blocks=self._num_blocks_for_case(input_ids, block_size=block_size),
             block_size=block_size,
             num_layers=self.self_model.num_layers,
             num_kv_heads=self.self_model.num_kv_heads,
@@ -77,7 +82,11 @@ class Stage1RegressionTest(unittest.TestCase):
 
     def _self_greedy_ids(self, input_ids, steps, block_size=16):
         bm = BlockManager(
-            num_blocks=100,
+            num_blocks=self._num_blocks_for_case(
+                input_ids,
+                block_size=block_size,
+                decode_steps=steps,
+            ),
             block_size=block_size,
             num_layers=self.self_model.num_layers,
             num_kv_heads=self.self_model.num_kv_heads,

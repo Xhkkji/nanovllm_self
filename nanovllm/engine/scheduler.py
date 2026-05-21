@@ -27,7 +27,7 @@ class Scheduler:
 
     def schedule(self):
         # 当waiting队列不为空，优先处理waiting队列（需要prefill的seq）
-        seq_list = []
+        seq_list = deque()
         num_seqs = 0
         num_batched_tokens = 0
         while self.waiting and num_seqs < self.max_num_seqs:
@@ -61,6 +61,7 @@ class Scheduler:
         assert seq_list
         # deque extendleft的时候会把队列倒过来接在右边，因此需要手动把seq_list反过来
         self.running.extendleft(reversed(seq_list))
+        return seq_list, False
     
     def preempty(seq):
         """
@@ -69,6 +70,20 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         seq.status = SequenceStatus.WAITING
         self.waiting.appendleft(seq)
+
+    def postprocess(self, seq, token_ids):
+        """
+        token_ids为decode新生成的token，现在处理新token，判断是否已经生成结束
+        标准版需要实现seq:List[seq], token_ids:List[int],即批量seq
+        """
+        seq.append_token(token_ids)
+        # 如果调度需要结束
+        if token_ids == self.eos or seq.num_completion_tokens == self.max_num_batched_tokens:
+            seq.status = SequenceStatus.FINISHED
+            self.block_manager.deallocate(seq)
+            self.running.remove(seq)
+
+
 
 
 

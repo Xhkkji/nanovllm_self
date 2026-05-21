@@ -26,7 +26,7 @@ class Block:
 
     def update(self, h: int, token_ids: List[int], prev_hash):
         self.hash = h
-        self.token_ids = token_ids.copy()
+        self.token_ids = token_ids
         self.prev_hash = prev_hash
 
     def reset(self):
