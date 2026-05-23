@@ -56,15 +56,15 @@ class QwenDecoderLayer(nn.Module):
         x与seq对应，seq会记录哪些token的kv已经存储过了（通过num_cached_tokens），避免重复计算
         但是seq在prefill阶段不做修改
         """
-        x = x.unsqueeze(0)  # [1, token_len, hidden_size]，添加batch维度，方便统一处理
+        # x = x.unsqueeze(0)  # [1, token_len, hidden_size]，添加batch维度，方便统一处理
         residual = x
         x = self.ln1(x)
-        # x.shape: [1, token_len, hidden_size]
-        batch, seq_len, encode_dim = x.shape
+        # x.shape: [token_len, hidden_size]
+        seq_len, encode_dim = x.shape
         # x = x.view(batch * seq_len, encode_dim)  # 展平为[batch*seq_len, hidden_size]，一次性投影所有token
-        q = self.q_proj(x).view(batch, seq_len, self.num_heads, self.head_dim)  # [batch, seq_len, num_heads, head_dim]
-        k = self.k_proj(x).view(batch, seq_len, self.num_kv_heads, self.head_dim)  # [batch, seq_len, num_kv_heads, head_dim]
-        v = self.v_proj(x).view(batch, seq_len, self.num_kv_heads, self.head_dim)  # [batch, seq_len, num_kv_heads, head_dim]
+        q = self.q_proj(x).view(seq_len, self.num_heads, self.head_dim)  # [seq_len, num_heads, head_dim]
+        k = self.k_proj(x).view(seq_len, self.num_kv_heads, self.head_dim)  # [seq_len, num_kv_heads, head_dim]
+        v = self.v_proj(x).view(seq_len, self.num_kv_heads, self.head_dim)  # [seq_len, num_kv_heads, head_dim]
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -77,20 +77,20 @@ class QwenDecoderLayer(nn.Module):
         if self.num_heads != self.num_kv_heads:
             # GQA 复制 KV 头以匹配 Q 头数
             groups = self.num_heads // self.num_kv_heads
-            k = k.repeat_interleave(groups, dim=2)  # [batch, seq_len, num_heads, head_dim]
-            v = v.repeat_interleave(groups, dim=2)  # [batch, seq_len, num_heads, head_dim]
-        q = q.permute(0, 2, 1, 3)  # [batch, num_heads, seq_len, head_dim]
-        k = k.permute(0, 2, 1, 3)
-        v = v.permute(0, 2, 1, 3)
+            k = k.repeat_interleave(groups, dim=1)  # [seq_len, num_heads, head_dim], 扩充num_heads
+            v = v.repeat_interleave(groups, dim=1)  # [seq_len, num_heads, head_dim]
+        q = q.permute(1, 0, 2)  # [num_heads, seq_len, head_dim]
+        k = k.permute(1, 0, 2)
+        v = v.permute(1, 0, 2)
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)  # [batch, num_heads, seq_len, seq_len]
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)  # [num_heads, seq_len, seq_len]
         causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=scores.device), diagonal=1).bool()
         scores = scores.masked_fill(causal_mask, float('-inf'))
         # print(f"[DEBUG] prefill: scores={scores}")
-        attn_weights = F.softmax(scores, dim=-1)  # [batch, num_heads, seq_len, seq_len]
-        attn_output = torch.matmul(attn_weights, v)  # [batch, num_heads, seq_len, head_dim]
-        attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(batch, seq_len, self.num_heads * self.head_dim)  # [batch, seq_len, hidden_size]
-        attn_output = self.o_proj(attn_output)  # [batch, seq_len]
+        attn_weights = F.softmax(scores, dim=-1)  # [num_heads, seq_len, seq_len]
+        attn_output = torch.matmul(attn_weights, v)  # [num_heads, seq_len, head_dim]
+        attn_output = attn_output.permute(1, 0, 2).contiguous().view(seq_len, self.num_heads * self.head_dim)  # [seq_len, hidden_size]
+        attn_output = self.o_proj(attn_output)  # [seq_len]
         x = attn_output + residual  # 残差连接
 
         residual = x
@@ -258,7 +258,7 @@ class Qwen3Model(nn.Module):
             # x.shape:torch.Size([1, token_len, 1024])
             print(f"prefill..")
             for layer in self.layers:
-                x = layer.prefill(x, block_manager, seq, positions=positions, rotary_embedding=self.rotary_embedding)
+                x = layer.prefill(x, block_manager, seq=seq, positions=positions, rotary_embedding=self.rotary_embedding)
             # x.shape=torch.Size([11, 1024])
             # print(f"[DEBUG] prefill forward: after layers, x.shape={x.shape}")
         

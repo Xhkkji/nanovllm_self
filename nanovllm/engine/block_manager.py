@@ -115,7 +115,7 @@ class block_manager:
     def set_kv_prefill(self, k, v, seq, layer):
         """
         prefill阶段一次性存储所有token的kv
-        k, v 形状: [batch, seq_len, num_kv_heads, head_dim]
+        k, v 形状: [seq_len, num_kv_heads, head_dim]
         """
         # seq.token_ids.shape=torch.Size([1, token_len])
         # print(f"seq.token_ids:{seq.token_ids}")
@@ -126,7 +126,7 @@ class block_manager:
             block_idx = token_idx // self.block_size
             block_id = block_table[block_idx]  # 取出对应的真实物理块id
             offset = token_idx % self.block_size
-            self.set_kv(block_id, offset, layer, k[0, token_idx], v[0, token_idx])
+            self.set_kv(block_id, offset, layer, k[token_idx], v[token_idx])
                 
 
         # batch, seq_len, num_kv_heads, head_dim = k_raw.shape

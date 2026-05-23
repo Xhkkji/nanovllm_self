@@ -29,7 +29,7 @@ else:
     input_tensor = torch.tensor(all_tokens).unsqueeze(0)  # 为了方便批处理，batch维度最好保留
     print(f"input_tensor shape: {input_tensor.shape}")  # 添加调试输出，查看输入张量的形状
     start_time = time.time()
-    all_tokens = llm.generate(input_tensor, 256, temperature=0.7)
+    all_tokens = llm.generate(input_tensor)
     end_time = time.time()
     print(f'using time:{end_time - start_time}')
     print(llm.decode(all_tokens))

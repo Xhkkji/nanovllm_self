@@ -25,7 +25,7 @@ class Scheduler:
         else:
             return False
 
-    def schedule(self):
+    def schedule(self) -> (list[Sequence], bool):
         # 当waiting队列不为空，优先处理waiting队列（需要prefill的seq）
         seq_list = deque()
         num_seqs = 0
@@ -38,7 +38,7 @@ class Scheduler:
             seq.status = SequenceStatus.RUNNING
             self.waiting.popleft()
             self.running.appendleft(seq)
-            self.block_manager.allocate(seq)
+            self.block_manager.allocate(seq)  # 分配块并进行前缀共享, 将分配的块表关联到序列
             num_seqs += 1
             num_batched_tokens += len(seq)
         if seq_list:
@@ -63,7 +63,7 @@ class Scheduler:
         self.running.extendleft(reversed(seq_list))
         return seq_list, False
     
-    def preempty(seq):
+    def preempty(self, seq):
         """
         调度失败，重新放回wait队列
         """
@@ -71,19 +71,23 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seq, token_ids):
+    def postprocess(self, seq_list, token_ids):
         """
         token_ids为decode新生成的token，现在处理新token，判断是否已经生成结束
         标准版需要实现seq:List[seq], token_ids:List[int],即批量seq
         """
-        seq.append_token(token_ids)
-        # 如果调度需要结束
-        if token_ids == self.eos or seq.num_completion_tokens == self.max_num_batched_tokens:
-            seq.status = SequenceStatus.FINISHED
-            self.block_manager.deallocate(seq)
-            self.running.remove(seq)
-
-
+        finished_list = []
+        for i, seq in enumerate(seq_list):
+            seq.append_token(token_ids[i])
+            seq.num_prompt_tokens += 1
+            self.running.appendleft(seq)
+            # 如果调度需要结束
+            if token_ids[i] == self.eos or seq.num_completion_tokens == seq.num_prompt_tokens:
+                seq.status = SequenceStatus.FINISHED
+                self.block_manager.deallocate(seq)
+                self.running.remove(seq)
+                finished_list.append(seq)
+        return finished_list
 
 
 

@@ -58,17 +58,17 @@ class RotaryEmbedding(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,   # 形状 [batch, seq_len] 或 [seq_len]，表示每个 token 的绝对位置
-        query: torch.Tensor,       # 形状 [batch, seq_len, head_num, head_size]
+        query: torch.Tensor,       # 形状 [seq_len, head_num, head_size]
         key: torch.Tensor,         # 同上
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # 根据 positions 中的每个索引值，从 cos_sin_cache 的第 0 维（位置维）取出对应行的数据。
         # 索引操作会保留 positions 的前面所有维度，并附加 cos_sin_cache 的剩余维度
-        # 因为 positions 有 batch 维度，所以结果也有了 batch 维度
-        cos_sin = self.cos_sin_cache[positions]  # [batch, seq_len, 1, rotary_dim]
-        cos, sin = cos_sin.chunk(2, dim=-1)  # 各为 [batch, seq_len, 1, rotary_dim/2]
 
-        # query\key 形状 [batch, seq_len, head_num, head_size]，head_size = rotary_dim。
-        # cos, sin 形状 [batch, seq_len, 1, rotary_dim/2]，广播到所有头。
+        cos_sin = self.cos_sin_cache[positions]  # [seq_len, 1, rotary_dim]
+        cos, sin = cos_sin.chunk(2, dim=-1)  # 各为 [seq_len, 1, rotary_dim/2]
+
+        # query\key 形状 [seq_len, head_num, head_size]，head_size = rotary_dim。
+        # cos, sin 形状 [seq_len, 1, rotary_dim/2]，广播到所有头。
         query = apply_rotary_embedding(query, cos, sin)
         key = apply_rotary_embedding(key, cos, sin)
         return query, key

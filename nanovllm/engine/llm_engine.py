@@ -7,6 +7,7 @@ from transformers import AutoConfig
 from nanovllm.engine.block_manager import block_manager as bm
 from nanovllm.engine.Sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
+from nanovllm.engine.model_runner import ModelRunner
 
 config = Config(
     model_path="/home/xhk/model/Qwen3-0.6B/",
@@ -105,67 +106,48 @@ class llm_engine_self():
     )
     print("✅ BlockManager 创建成功")
     self.scheduler = Scheduler(config, self.block_manager)
+    self.model_runner = ModelRunner(config, self.block_manager)
 
   def encoder(self, text):
     return self.tokenizer(text)
   
-  def step(self):
+  # def step(self):
     
 
-  def generate(self, input, max_token = 20, temperature=0.8):
+  def generate(self, input):
     seq = None
+    finished_seqs = []
     try:
       print("\n创建Sequence...")
       print(f"  Prompt tokens: {input}")
-      seq = Sequence(seq_idx=0, token_ids=input[0].to(self.config.device))  # 取出 token 列表,没有batch维度
-      seq.block_size = self.block_manager.block_size  # 添加 block_size 属性
-      seq.block_table = self.block_manager.allocate_with_prefill(seq)  # 分配块并进行前缀共享, 将分配的块表关联到序列
-      print(f"✅ Sequence 创建成功，分配块ID: {seq.block_table}")
+      seq = Sequence(seq_idx=0, token_ids=input[0].tolist())  # 取出 token 列表,没有batch维度
+      # seq.block_size = self.block_manager.block_size  # 添加 block_size 属性
+      # seq.block_table = self.block_manager.allocate_with_prefill(seq)  # 分配块并进行前缀共享, 将分配的块表关联到序列
+      # print(f"✅ Sequence 创建成功，分配块ID: {seq.block_table}")
 
       self.scheduler.add(seq)
-      seq_list, is_prefill = self.scheduler.schedule()
+      while not self.scheduler.is_finished():
+        seq_list, is_prefill = self.scheduler.schedule()
+        if is_prefill:
+          input_list, position = self.model_runner.prepare_prefill(seq_list)
+        else:
+          # 批量逻辑还没实现
+          input_list, position = self.model_runner.prepare_decode(seq_list)
 
-      for i in tqdm(range(max_token)):
-        if self.scheduler.is_finished():
-          break
+        outputs_logits = self.model_runner.run(input_list, position, is_prefill)
+        seq_next_tokens = self.model_runner.sample(outputs_logits, seq_list)
+        
+        # 将新生成的token加入seq，并根据block是否已满更新block，下一轮训练会将新token的kv存入kvcache
+        finished_seqs.extend(self.scheduler.postprocess(seq_list, seq_next_tokens)) # 更新 seq 的 token 列表，供 block_manager 存储 KV 时使用
 
-        with torch.no_grad():
-          if is_prefill:
-            current_tokens = seq_list.popleft().token_ids  # prefill阶段输入整个序列，current_tokens为[seq_len]
-            positions = torch.arange(0, len(seq.token_ids), device=self.config.device).unsqueeze(0)
-            outputs = self.model(current_tokens, positions=positions, block_manager=self.block_manager, seq=seq, is_prefill=True)
-            outputs_logits = outputs[-1, :].unsqueeze(0)  # [batch, token_len, vocab_dim]
-            is_prefill = False
-          else:
-            current_tokens = seq_list.popleft().token_ids[-1:]  # 取最后一个token
-            # outputs:(token_num, vocab_len)
-            outputs = self.model(current_tokens, positions=torch.tensor([[len(seq.token_ids)-1]], device=self.config.device), block_manager=self.block_manager, seq=seq, is_prefill=False)
-            outputs_logits = outputs.unsqueeze(0)  # [batch, token_len, vocab_dim]
-
-          # outputs.logits.shape:batchsize, seq_len, vocab_size
-          # 对于logits，其输出为batch、all_tokens长度+1，即每个单词都会预测下一个单词，但是最后一个才是all_token的下一个单词，从最后一维(vocab_len)中选出概率最大的词元
-          # 引入温度采样
-          # print(f"outputs_logits shape: {outputs_logits.shape}")  # 添加调试输出，查看 logits 的形状
-          # outputs_logits = outputs[:, -1, :]  # 取最后一个词元[batch, 1, vocab_size]
-          if temperature > 0:
-            outputs_logits /= temperature
-            probs = torch.softmax(outputs_logits, dim=-1)
-          # next_token = torch.argmax(outputs.logits[0, -1, :])
-          # 按照概率分布随机取1个，next_tokens为所有batch的下一个token
-            next_tokens = torch.multinomial(probs, num_samples=1)  # [1]
-          else:
-            next_tokens = torch.argmax(outputs_logits)  # [1]
-          
-          # 将新生成的token加入seq，并根据block是否已满更新block，下一轮训练会将新token的kv存入kvcache
-          new_token_id = next_tokens.squeeze(dim=0)
-          self.scheduler.postprocess(seq, new_token_id) # 更新 seq 的 token 列表，供 block_manager 存储 KV 时使用
-          if len(seq.token_ids) > len(seq.block_table) * self.block_manager.block_size:
-              # print(f"Warning: seq长度超过已分配块的容量，可能需要分配更多块")
-              new_block_id = self.block_manager.allocate_block(1)[0]  # 分配一个新块
-              seq.block_table.append(new_block_id)  # 更新 seq 的块表
-
-      return seq.token_ids
-
+    finally:
+      if seq is not None and getattr(seq, "block_table", None):
+        self.block_manager.free_blocks(seq.block_table)
+        output = []
+        for seq in finished_seqs:
+          output.append(seq.token_ids)
+        return output
+      
 
 
     # seq = None
@@ -234,12 +216,13 @@ class llm_engine_self():
 
     #   return all_tokens
       
-    finally:
-      if seq is not None and getattr(seq, "block_table", None):
-        self.block_manager.free_blocks(seq.block_table)
+    # finally:
+    #   if seq is not None and getattr(seq, "block_table", None):
+    #     self.block_manager.free_blocks(seq.block_table)
       
       
 
   def decode(self, all_tokens):
     # return self.tokenizer.decode(all_tokens)
+    print(f'all_token:{all_token}')
     return self.tokenizer.decode(all_tokens[0], skip_special_tokens=True)
