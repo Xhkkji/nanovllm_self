@@ -79,10 +79,8 @@ class Scheduler:
         finished_list = []
         for i, seq in enumerate(seq_list):
             seq.append_token(token_ids[i])
-            seq.num_prompt_tokens += 1
-            self.running.appendleft(seq)
             # 如果调度需要结束
-            if token_ids[i] == self.eos or seq.num_completion_tokens == seq.num_prompt_tokens:
+            if token_ids[i] == self.eos or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)

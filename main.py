@@ -4,7 +4,8 @@ import time
 import torch
 from transformers import AutoConfig
 
-text = "大模型是什么？简单解释一下."
+text = "大模型是什么？请用自然、生动、带有画面感的语言解释一下."
+# text ="What is LLM?Please introduce it."
 # text = "请用自然、生动、带有画面感的语言，介绍中国的ACG文化，并简要对比日本ACG文化。"
 
 use_self = True

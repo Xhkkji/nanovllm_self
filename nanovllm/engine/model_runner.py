@@ -73,22 +73,24 @@ class ModelRunner(nn.Module):
     
     def run(self, li, position, is_prefill: bool):
         # 处理一批seq
+        last_logits = []
         if is_prefill:
-            last_logits = []
             seq_list = li  # 一维列表，所有seq的token拼成一列同时处理
             for i, seq in enumerate(seq_list):
                 # torch.Size([token_ids.len, 151936])
                 outputs = self.model(torch.tensor(seq.token_ids, device=self.config.device), positions=torch.tensor(position[i], device=self.config.device), block_manager=self.block_manager, seq=seq, is_prefill=is_prefill)
                 last_logits.append(outputs[-1])
-            print(f'last_logits{last_logits}')
+            # print(f'last_logits{last_logits}')
             return last_logits  # [seq_num, vocab_dim]
         else:
             # 批量暂未实现，先逐seq处理
             seq_list = li
             for i, seq in enumerate(seq_list):
-                outputs = self.model(seq.last_token, position=position[i], block_manager=block_manager, seq=seq, is_prefill=is_prefill)
-                last_logits.append(outputs[-1])
-            print(f'last_logits{last_logits}')
+                outputs = self.model(torch.tensor([seq.last_token], device=self.config.device), positions=torch.tensor(position[i], device=self.config.device), block_manager=self.block_manager, seq=seq, is_prefill=is_prefill)
+                # print(f'outputs:{outputs}')
+                # outputs:[1, vocab_size]
+                last_logits.append(outputs)
+            # print(f'last_logits{last_logits}')
             return last_logits  # [seq_num, vocab_dim]
         
 
@@ -125,9 +127,9 @@ class ModelRunner(nn.Module):
                 probs = torch.softmax(outputs_logits, dim=-1)
             # next_token = torch.argmax(outputs.logits[0, -1, :])
             # 按照概率分布随机取1个，next_tokens为所有batch的下一个token
-                next_tokens = torch.multinomial(probs, num_samples=1)  # [1]
+                next_tokens = torch.multinomial(probs, num_samples=1).item()  # [1]
             else:
-                next_tokens = torch.argmax(outputs_logits)  # [1]
+                next_tokens = torch.argmax(outputs_logits).item()  # [1]
             seq_next_tokens.append(next_tokens)
         return seq_next_tokens
         

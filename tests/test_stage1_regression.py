@@ -52,7 +52,7 @@ class Stage1RegressionTest(unittest.TestCase):
         seq = Sequence(seq_idx=0, token_ids=input_ids[0].tolist())
         seq.block_size = block_size
         seq.block_table = bm.allocate_with_prefill(seq)
-        positions = torch.arange(0, len(seq.token_ids), device=DEVICE).unsqueeze(0)
+        positions = torch.arange(0, len(seq.token_ids), device=DEVICE)
 
         with torch.no_grad():
             out = self.self_model(
@@ -103,7 +103,7 @@ class Stage1RegressionTest(unittest.TestCase):
             for _ in range(steps):
                 if is_prefill:
                     current = tokens[0]
-                    positions = torch.arange(0, len(seq.token_ids), device=DEVICE).unsqueeze(0)
+                    positions = torch.arange(0, len(seq.token_ids), device=DEVICE)
                     out = self.self_model(
                         current,
                         positions=positions,

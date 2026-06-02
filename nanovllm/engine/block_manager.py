@@ -73,10 +73,9 @@ class block_manager:
         """
         # 判断“是否将要或刚刚进入一个新的物理块
         # 并且即使没有free_block了也不一定就不能append，因为可能有未满的已分配块
-        if (len(seq) % self.block_size == 1 and len(self.free_blocks_idx) >= 1) or seq.last_block_num_tokens != seq.block_size:
-            return True
-        else:
-            return False
+        if len(seq) % self.block_size == 1:
+            return len(self.free_blocks_idx) >= 1
+        return True
     
     def may_append(self, seq:Sequence):
         """
@@ -92,9 +91,11 @@ class block_manager:
             seq.block_table.append(new_block_id)
         elif len(seq) % self.block_size == 0:  # 装入后刚好块满，需要更新hash
             last_block_id = seq.block_table[-1]
-            prev_block_id = seq.block_table[-2]
-            self.blocks[last_block_id].hash = self.compute_hash(self.blocks[last_block_id].token_ids, self.blocks[last_block_id].prev_hash)
-            self.hash_to_block_id[self.blocks[last_block_id].hash] = last_block_id
+            token_ids = seq.token_ids[-self.block_size:]
+            prefix = self.blocks[seq.block_table[-2]].hash if len(seq.block_table) > 1 else -1
+            h = self.compute_hash(token_ids, prefix)
+            self.blocks[last_block_id].update(h, token_ids, prefix)
+            self.hash_to_block_id[h] = last_block_id
         else:
             last_block_id = seq.block_table[-1]
             assert self.blocks[last_block_id].hash == -1  # 块未满，hash不赋值
@@ -103,7 +104,13 @@ class block_manager:
         return self.allocate_with_prefill(seq)
     
     def deallocate(self, seq:Sequence):
-        self.free_blocks(seq.block_table)
+        if not seq.block_table:
+            return
+        
+        block_ids = seq.block_table
+        self.free_blocks(block_ids)
+        seq.block_table = []
+        seq.num_cached_tokens = 0
 
 
     def set_kv(self, block_id, offset, layer, k, v):

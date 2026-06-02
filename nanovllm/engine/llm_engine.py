@@ -117,15 +117,17 @@ class llm_engine_self():
   def generate(self, input):
     seq = None
     finished_seqs = []
-    try:
-      print("\n创建Sequence...")
-      print(f"  Prompt tokens: {input}")
-      seq = Sequence(seq_idx=0, token_ids=input[0].tolist())  # 取出 token 列表,没有batch维度
-      # seq.block_size = self.block_manager.block_size  # 添加 block_size 属性
-      # seq.block_table = self.block_manager.allocate_with_prefill(seq)  # 分配块并进行前缀共享, 将分配的块表关联到序列
-      # print(f"✅ Sequence 创建成功，分配块ID: {seq.block_table}")
+    print("\n创建Sequence...")
+    print(f"  Prompt tokens: {input}")
+    seq = Sequence(seq_idx=0, token_ids=input[0].tolist(), block_size=self.config.block_size)  # 取出 token 列表,没有batch维度
+    # seq.block_size = self.block_manager.block_size  # 添加 block_size 属性
+    # seq.block_table = self.block_manager.allocate_with_prefill(seq)  # 分配块并进行前缀共享, 将分配的块表关联到序列
+    # print(f"✅ Sequence 创建成功，分配块ID: {seq.block_table}")
 
-      self.scheduler.add(seq)
+    self.scheduler.add(seq)
+    pbar = tqdm(total=seq.max_tokens, desc="Generating", dynamic_ncols=True)
+
+    with torch.inference_mode():
       while not self.scheduler.is_finished():
         seq_list, is_prefill = self.scheduler.schedule()
         if is_prefill:
@@ -137,19 +139,21 @@ class llm_engine_self():
         outputs_logits = self.model_runner.run(input_list, position, is_prefill)
         seq_next_tokens = self.model_runner.sample(outputs_logits, seq_list)
         
+        # print(seq_next_tokens, [type(x) for x in seq_next_tokens])
+        prev_completion = seq.num_completion_tokens
         # 将新生成的token加入seq，并根据block是否已满更新block，下一轮训练会将新token的kv存入kvcache
         finished_seqs.extend(self.scheduler.postprocess(seq_list, seq_next_tokens)) # 更新 seq 的 token 列表，供 block_manager 存储 KV 时使用
+        new_completion = seq.num_completion_tokens
+        pbar.update(new_completion - prev_completion)
 
-    finally:
-      if seq is not None and getattr(seq, "block_table", None):
-        self.block_manager.free_blocks(seq.block_table)
-        output = []
-        for seq in finished_seqs:
-          output.append(seq.token_ids)
-        return output
+      output = []
+      for seq in finished_seqs:
+        output.append(seq.token_ids)
+
+    pbar.close()
+    return output
+
       
-
-
     # seq = None
     # try:
     #   print("\n创建Sequence...")
@@ -224,5 +228,5 @@ class llm_engine_self():
 
   def decode(self, all_tokens):
     # return self.tokenizer.decode(all_tokens)
-    print(f'all_token:{all_token}')
+    print(f'all_tokens:{all_tokens}')
     return self.tokenizer.decode(all_tokens[0], skip_special_tokens=True)
