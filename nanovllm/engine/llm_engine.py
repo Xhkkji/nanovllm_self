@@ -87,70 +87,70 @@ class llm_engine_self():
     # self.text = text
     print("llm_engine_self..")
     self.tokenizer = AutoTokenizer.from_pretrained('/home/xhk/model/Qwen3-0.6B')
-    model_config = AutoConfig.from_pretrained("/home/xhk/model/Qwen3-0.6B/")
-    self.model = Qwen3Model(model_config).to(config.device)
+    # model_config = AutoConfig.from_pretrained("/home/xhk/model/Qwen3-0.6B/")
+    # self.model = Qwen3Model(model_config).to(config.device)
     self.config = config
     self.tensor_parallel_size = tensor_parallel_size
     self.eos_token_id = self.tokenizer.eos_token_id
 
-    """
-    generate处理的是一整个流程，bm和seq应该在这里创建
-    """
-    print("\n创建 BlockManager...")
-    self.block_manager = bm(
-        num_blocks=self.config.num_blocks,
-        block_size=self.config.block_size,
-        num_layers=self.model.num_layers,
-        num_kv_heads=self.model.num_kv_heads,
-        head_dim=self.model.head_dim
-    )
-    print("✅ BlockManager 创建成功")
-    self.scheduler = Scheduler(config, self.block_manager)
-    self.model_runner = ModelRunner(config, self.block_manager)
+    # """
+    # generate处理的是一整个流程，bm和seq应该在这里创建
+    # """
+    # print("\n创建 BlockManager...")
+    # self.block_manager = bm(
+    #     num_blocks=self.config.num_blocks,
+    #     block_size=self.config.block_size,
+    #     num_layers=self.model.num_layers,
+    #     num_kv_heads=self.model.num_kv_heads,
+    #     head_dim=self.model.head_dim
+    # )
+    # print("✅ BlockManager 创建成功")
+    self.model_runner = ModelRunner(config)
+    self.scheduler = Scheduler(config, self.model_runner.block_manager)
+    
 
   def encoder(self, text):
     return self.tokenizer(text)
   
-  # def step(self):
-    
-
-  def generate(self, input):
-    seq = None
+  def generate(self, inputs):
+    all_seqs = []
     finished_seqs = []
     print("\n创建Sequence...")
-    print(f"  Prompt tokens: {input}")
-    seq = Sequence(seq_idx=0, token_ids=input[0].tolist(), block_size=self.config.block_size)  # 取出 token 列表,没有batch维度
-    # seq.block_size = self.block_manager.block_size  # 添加 block_size 属性
-    # seq.block_table = self.block_manager.allocate_with_prefill(seq)  # 分配块并进行前缀共享, 将分配的块表关联到序列
-    # print(f"✅ Sequence 创建成功，分配块ID: {seq.block_table}")
+    print(f"  Prompt tokens: {inputs}")
+    for i, input in enumerate(inputs):
+      seq = Sequence(seq_idx=i, token_ids=input.tolist(), block_size=self.config.block_size)  # 取出 token 列表,没有batch维度
+      self.scheduler.add(seq)
+      all_seqs.append(seq)
 
-    self.scheduler.add(seq)
-    pbar = tqdm(total=seq.max_tokens, desc="Generating", dynamic_ncols=True)
+    # pbar = tqdm(total=seq.max_tokens, desc="Generating", dynamic_ncols=True)
+    # 多 seq 时，进度条总量用所有 seq 的 max_tokens 总和更合理
+    total_max_tokens = sum(seq.max_tokens for seq in all_seqs)
+    pbar = tqdm(total=total_max_tokens, desc="Generating", dynamic_ncols=True)
 
     with torch.inference_mode():
       while not self.scheduler.is_finished():
-        seq_list, is_prefill = self.scheduler.schedule()
-        if is_prefill:
-          input_list, position = self.model_runner.prepare_prefill(seq_list)
-        else:
-          # 批量逻辑还没实现
-          input_list, position = self.model_runner.prepare_decode(seq_list)
+        # 统计本轮调度前，所有 seq 一共已经生成了多少 completion token
+        prev_completion = sum(seq.num_completion_tokens for seq in all_seqs)
 
-        outputs_logits = self.model_runner.run(input_list, position, is_prefill)
-        seq_next_tokens = self.model_runner.sample(outputs_logits, seq_list)
-        
+        seq_list, is_prefill = self.scheduler.schedule()  # 此处已经对seq的token分配了block
+        seq_next_tokens = self.model_runner.run(seq_list, is_prefill)
+        # 规范化处理，保证加入seq的是列表而不是tensor
+        if isinstance(seq_next_tokens, torch.Tensor):
+          seq_next_tokens = seq_next_tokens.squeeze(-1).tolist()
+        seq_next_tokens = [int(x) for x in seq_next_tokens]
         # print(seq_next_tokens, [type(x) for x in seq_next_tokens])
-        prev_completion = seq.num_completion_tokens
-        # 将新生成的token加入seq，并根据block是否已满更新block，下一轮训练会将新token的kv存入kvcache
-        finished_seqs.extend(self.scheduler.postprocess(seq_list, seq_next_tokens)) # 更新 seq 的 token 列表，供 block_manager 存储 KV 时使用
-        new_completion = seq.num_completion_tokens
-        pbar.update(new_completion - prev_completion)
 
-      output = []
-      for seq in finished_seqs:
-        output.append(seq.token_ids)
+        # 将新生成的token加入seq，并根据block是否已满更新block，下一轮训练会将新token的kv存入kvcache
+        self.scheduler.postprocess(seq_list, seq_next_tokens)# 更新 seq 的 token 列表，供 block_manager 存储 KV 时使用
+        new_completion = sum(seq.num_completion_tokens for seq in all_seqs)
+        
+        pbar.update(new_completion - prev_completion)
+      # output = []
+      # for seq in finished_seqs:
+      #   output.append(seq.token_ids)
 
     pbar.close()
+    output = [seq.token_ids for seq in all_seqs]
     return output
 
       
@@ -228,5 +228,5 @@ class llm_engine_self():
 
   def decode(self, all_tokens):
     # return self.tokenizer.decode(all_tokens)
-    print(f'all_tokens:{all_tokens}')
-    return self.tokenizer.decode(all_tokens[0], skip_special_tokens=True)
+    print(f'Decoding all_tokens:{all_tokens}')
+    return self.tokenizer.decode(all_tokens, skip_special_tokens=True)

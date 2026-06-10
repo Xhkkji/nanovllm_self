@@ -49,12 +49,12 @@ class block_manager:
         self.free_blocks_idx:deque[int] = deque(range(num_blocks))  # 生成1-num_blocks的整数序列，表示哪些块还未分配
         self.used_blocks_idx:set[int] = set()  # 哪些块已被使用
 
-        # 分配kv_cache
-        # 形状: [num_blocks, block_size, 2(key和value), num_layers, num_kv_heads, head_dim]
-        self.kv_cache = torch.zeros(
-            num_blocks, block_size, 2, num_layers, num_kv_heads, head_dim,
-            dtype=dtype, device=device
-        )
+        # # 分配kv_cache
+        # # 形状: [num_blocks, block_size, 2(key和value), num_layers, num_kv_heads, head_dim]
+        # self.kv_cache = torch.zeros(
+        #     num_blocks, block_size, 2, num_layers, num_kv_heads, head_dim,
+        #     dtype=dtype, device=device
+        # )
     
     def can_allocate(self, seq:Sequence):
         """
@@ -112,76 +112,58 @@ class block_manager:
         seq.block_table = []
         seq.num_cached_tokens = 0
 
-
-    def set_kv(self, block_id, offset, layer, k, v):
-        """写入 KV 到指定块的位置， offset为块内偏移，即第几个token"""
-        # k, v 形状: [num_kv_heads, head_dim]
-        self.kv_cache[block_id, offset, 0, layer] = k
-        self.kv_cache[block_id, offset, 1, layer] = v
+    # def set_kv(self, block_id, offset, layer, k, v):
+    #     """写入 KV 到指定块的位置， offset为块内偏移，即第几个token"""
+    #     # k, v 形状: [num_kv_heads, head_dim]
+    #     self.kv_cache[block_id, offset, 0, layer] = k
+    #     self.kv_cache[block_id, offset, 1, layer] = v
     
-    def set_kv_prefill(self, k, v, seq, layer):
-        """
-        prefill阶段一次性存储所有token的kv
-        k, v 形状: [seq_len, num_kv_heads, head_dim]
-        """
-        # seq.token_ids.shape=torch.Size([1, token_len])
-        # print(f"seq.token_ids:{seq.token_ids}")
-        token_ids = seq.token_ids  # 取出 token 列表
-        block_table = seq.block_table
+    # def set_kv_prefill(self, k, v, seq, layer):
+    #     """
+    #     prefill阶段一次性存储所有token的kv
+    #     k, v 形状: [seq_len, num_kv_heads, head_dim]
+    #     """
+    #     # seq.token_ids.shape=torch.Size([1, token_len])
+    #     # print(f"seq.token_ids:{seq.token_ids}")
+    #     token_ids = seq.token_ids  # 取出 token 列表
+    #     block_table = seq.block_table
 
-        for token_idx in range(len(token_ids)):
-            block_idx = token_idx // self.block_size
-            block_id = block_table[block_idx]  # 取出对应的真实物理块id
-            offset = token_idx % self.block_size
-            self.set_kv(block_id, offset, layer, k[token_idx], v[token_idx])
-                
+    #     for token_idx in range(len(token_ids)):
+    #         block_idx = token_idx // self.block_size
+    #         block_id = block_table[block_idx]  # 取出对应的真实物理块id
+    #         offset = token_idx % self.block_size
+    #         self.set_kv(block_id, offset, layer, k[token_idx], v[token_idx])
 
-        # batch, seq_len, num_kv_heads, head_dim = k_raw.shape
-        # assert batch == 1  # 目前仅支持 batch_size=1 的 prefill
 
-        # block_size = self.block_size
-        # token_ids = seq.token_ids  # [seq_len]
-        # block_table = seq.block_table  # [num_blocks]
-
-        # for i in range(0, seq_len, block_size):
-        #     block_idx = i // block_size
-        #     block_id = block_table[block_idx]
-        #     offset = 0
-        #     for j in range(i, min(i + block_size, seq_len)):
-        #         k = k_raw[0, j]  # [num_kv_heads, head_dim]
-        #         v = v_raw[0, j]  # [num_kv_heads, head_dim]
-        #         self.set_kv(block_id, offset, layer, k, v)
-        #         offset += 1
-
-    def get_kv(self, block_id, offset, layer):
-        """从指定块位置取出已经计算好的k和v,offset为块内偏移，即第几个token"""
-        # k, v 形状: [num_kv_heads, head_dim]
-        k = self.kv_cache[block_id, offset, 0, layer]
-        v = self.kv_cache[block_id, offset, 1, layer]
-        return k, v
+    # def get_kv(self, block_id, offset, layer):
+    #     """从指定块位置取出已经计算好的k和v,offset为块内偏移，即第几个token"""
+    #     # k, v 形状: [num_kv_heads, head_dim]
+    #     k = self.kv_cache[block_id, offset, 0, layer]
+    #     v = self.kv_cache[block_id, offset, 1, layer]
+    #     return k, v
     
-    def get_kv_block(self, seq, layer):
-        """
-        每次decode过程直接成批地取出上文的kv
-        kvcache形状：[num_blocks, block_size, 2, num_layers, num_kv_heads, head_dim]
-        """
-        block_size = self.block_size
-        block_table = seq.block_table
-        num_tokens = len(seq.token_ids)  # 该seq的token的总数
+    # def get_kv_block(self, seq, layer):
+    #     """
+    #     每次decode过程直接成批地取出上文的kv
+    #     kvcache形状：[num_blocks, block_size, 2, num_layers, num_kv_heads, head_dim]
+    #     """
+    #     block_size = self.block_size
+    #     block_table = seq.block_table
+    #     num_tokens = len(seq.token_ids)  # 该seq的token的总数
 
-        # print(f'block_table:{block_table}')
-        # 收集所有的kv
-        k_blocks = self.kv_cache[block_table, :, 0, layer, :, :]
-        # [num_seq, block_size, num_kv_heads, head_dim] -> [seq_len, num_kv_heads, head_dim]
-        all_k = k_blocks.reshape(-1, self.kv_cache.shape[-2], self.kv_cache.shape[-1])
-        # 截去未满块的空白内容
-        all_k = all_k[:num_tokens]
-        v_blocks = self.kv_cache[block_table, :, 1, layer, :, :]
-        all_v = v_blocks.reshape(-1, self.kv_cache.shape[-2], self.kv_cache.shape[-1])
-        all_v = all_v[:num_tokens]
-        # print(f"all_k:{all_k}")
-        # print(f"all_v:{all_v}")
-        return all_k, all_v
+    #     # print(f'block_table:{block_table}')
+    #     # 收集所有的kv
+    #     k_blocks = self.kv_cache[block_table, :, 0, layer, :, :]
+    #     # [num_seq, block_size, num_kv_heads, head_dim] -> [seq_len, num_kv_heads, head_dim]
+    #     all_k = k_blocks.reshape(-1, self.kv_cache.shape[-2], self.kv_cache.shape[-1])
+    #     # 截去未满块的空白内容
+    #     all_k = all_k[:num_tokens]
+    #     v_blocks = self.kv_cache[block_table, :, 1, layer, :, :]
+    #     all_v = v_blocks.reshape(-1, self.kv_cache.shape[-2], self.kv_cache.shape[-1])
+    #     all_v = all_v[:num_tokens]
+    #     # print(f"all_k:{all_k}")
+    #     # print(f"all_v:{all_v}")
+    #     return all_k, all_v
 
     # 按批分配，没有计算hash的过程，为block_manager初始化分配时使用的接口
     def allocate_block(self, num_blocks):

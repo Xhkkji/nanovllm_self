@@ -36,7 +36,13 @@ class Sequence:
         return self.token_ids[idx]
 
     def append_token(self, token):
-        """追加新生成的 token"""
+        """
+        追加新生成的 token
+        需要保证token_ids是list而不是张量
+        """
+        if isinstance(token, torch.Tensor):
+            token = token.item()
+        token = int(token)
         # print(type(token), token)
         self.token_ids.append(token)
         self.token_len += 1
@@ -48,6 +54,9 @@ class Sequence:
 
     @property
     def last_block_num_tokens(self):
+        """
+        返回最后一个块中的token数
+        """
         rem = len(self.token_ids) % self.block_size
         if rem == 0:
             return self.block_size

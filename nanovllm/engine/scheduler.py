@@ -8,11 +8,9 @@ class Scheduler:
     def __init__(self, config, block_manager):
         self.config = config
         self.block_manager = block_manager
-
         self.max_num_seqs = config.max_num_seqs  # 一轮调度里，最多同时处理多少条序列，“并发序列数上限”
         self.max_num_batched_tokens = config.max_num_batched_tokens  # 一轮调度里，最多处理多少个 token
         self.eos = config.eos
-        self.block_manager = block_manager
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
     

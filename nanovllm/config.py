@@ -1,12 +1,13 @@
 from dataclasses import dataclass
 import os
 from transformers import AutoConfig
+import torch
 
 @dataclass
 class Config:
     model_path: str
     device: str = "cuda:0"
-    dtype: str = "float16"
+    dtype: torch.dtype = torch.float16
     max_model_len: int = 2048
     max_num_seqs: int = 256  # 一轮调度里，最多同时处理多少条序列，“并发序列数上限”
     num_blocks: int = 256
