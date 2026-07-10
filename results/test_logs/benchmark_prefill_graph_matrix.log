@@ -1,0 +1,116 @@
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+graph warmup for bs=1..
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+graph warmup for bs=1..
+[short] bs=1 gen=64
+  torch_graph_off: TTFT=24.79 ms ITL=17.60 ms prefill_tok/s=282.34 decode_tok/s=57.71 throughput=56.44
+  flashattn_graph_off: TTFT=25.98 ms ITL=19.33 ms prefill_tok/s=269.45 decode_tok/s=52.55 throughput=51.45
+  torch_graph_on: TTFT=26.43 ms ITL=6.15 ms prefill_tok/s=264.84 decode_tok/s=165.29 throughput=154.73
+  flashattn_graph_on: TTFT=21.79 ms ITL=6.12 ms prefill_tok/s=321.22 decode_tok/s=165.90 throughput=157.03
+  flash_prefill_vs_base: TTFT -4.8% | prefill -4.6% | throughput -8.8%
+  graph_vs_base       : TTFT -6.6% | ITL +65.1% | throughput +174.1%
+  full_stack_vs_base  : TTFT +12.1% | ITL +65.2% | prefill +13.8% | throughput +178.2%
+
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+graph warmup for bs=8..
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+graph warmup for bs=8..
+[short] bs=8 gen=64
+  torch_graph_off: TTFT=54.85 ms ITL=18.50 ms prefill_tok/s=1020.99 decode_tok/s=439.41 throughput=419.65
+  flashattn_graph_off: TTFT=20.71 ms ITL=18.49 ms prefill_tok/s=2703.92 decode_tok/s=439.62 throughput=431.94
+  torch_graph_on: TTFT=55.45 ms ITL=6.58 ms prefill_tok/s=1010.00 decode_tok/s=1234.24 throughput=1088.73
+  flashattn_graph_on: TTFT=22.09 ms ITL=6.58 ms prefill_tok/s=2534.74 decode_tok/s=1235.10 throughput=1172.61
+  flash_prefill_vs_base: TTFT +62.2% | prefill +164.8% | throughput +2.9%
+  graph_vs_base       : TTFT -1.1% | ITL +64.4% | throughput +159.4%
+  full_stack_vs_base  : TTFT +59.7% | ITL +64.4% | prefill +148.3% | throughput +179.4%
+
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+graph warmup for bs=1..
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+graph warmup for bs=1..
+[medium] bs=1 gen=64
+  torch_graph_off: TTFT=25.10 ms ITL=17.83 ms prefill_tok/s=995.87 decode_tok/s=56.96 throughput=55.72
+  flashattn_graph_off: TTFT=20.61 ms ITL=17.54 ms prefill_tok/s=1213.04 decode_tok/s=57.91 throughput=56.85
+  torch_graph_on: TTFT=34.48 ms ITL=6.17 ms prefill_tok/s=724.95 decode_tok/s=164.59 throughput=151.18
+  flashattn_graph_on: TTFT=27.89 ms ITL=6.22 ms prefill_tok/s=896.45 decode_tok/s=163.33 throughput=152.48
+  flash_prefill_vs_base: TTFT +17.9% | prefill +21.8% | throughput +2.0%
+  graph_vs_base       : TTFT -37.4% | ITL +65.4% | throughput +171.3%
+  full_stack_vs_base  : TTFT -11.1% | ITL +65.1% | prefill -10.0% | throughput +173.7%
+
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+graph warmup for bs=8..
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+graph warmup for bs=8..
+[medium] bs=8 gen=64
+  torch_graph_off: TTFT=56.39 ms ITL=18.46 ms prefill_tok/s=3546.83 decode_tok/s=440.17 throughput=419.82
+  flashattn_graph_off: TTFT=20.41 ms ITL=18.38 ms prefill_tok/s=9797.57 decode_tok/s=442.04 throughput=434.39
+  torch_graph_on: TTFT=58.01 ms ITL=6.58 ms prefill_tok/s=3447.89 decode_tok/s=1234.74 throughput=1083.21
+  flashattn_graph_on: TTFT=21.52 ms ITL=6.59 ms prefill_tok/s=9292.11 decode_tok/s=1234.06 throughput=1173.20
+  flash_prefill_vs_base: TTFT +63.8% | prefill +176.2% | throughput +3.5%
+  graph_vs_base       : TTFT -2.9% | ITL +64.4% | throughput +158.0%
+  full_stack_vs_base  : TTFT +61.8% | ITL +64.3% | prefill +162.0% | throughput +179.5%
+
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+graph warmup for bs=1..
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+graph warmup for bs=1..
+[long] bs=1 gen=64
+  torch_graph_off: TTFT=25.59 ms ITL=17.58 ms prefill_tok/s=2227.83 decode_tok/s=57.80 throughput=56.49
+  flashattn_graph_off: TTFT=20.82 ms ITL=17.63 ms prefill_tok/s=2738.21 decode_tok/s=57.63 throughput=56.57
+  torch_graph_on: TTFT=34.47 ms ITL=6.19 ms prefill_tok/s=1653.70 decode_tok/s=164.25 throughput=150.90
+  flashattn_graph_on: TTFT=28.26 ms ITL=6.23 ms prefill_tok/s=2017.02 decode_tok/s=163.04 throughput=152.09
+  flash_prefill_vs_base: TTFT +18.6% | prefill +22.9% | throughput +0.1%
+  graph_vs_base       : TTFT -34.7% | ITL +64.8% | throughput +167.1%
+  full_stack_vs_base  : TTFT -10.5% | ITL +64.6% | prefill -9.5% | throughput +169.2%
+
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+graph warmup for bs=8..
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+graph warmup for bs=8..
+[long] bs=8 gen=64
+  torch_graph_off: TTFT=56.85 ms ITL=18.47 ms prefill_tok/s=8020.54 decode_tok/s=439.99 throughput=419.49
+  flashattn_graph_off: TTFT=26.67 ms ITL=21.87 ms prefill_tok/s=17100.51 decode_tok/s=371.60 throughput=364.54
+  torch_graph_on: TTFT=76.82 ms ITL=6.70 ms prefill_tok/s=5936.22 decode_tok/s=1213.20 throughput=1026.38
+  flashattn_graph_on: TTFT=21.48 ms ITL=6.58 ms prefill_tok/s=21228.88 decode_tok/s=1235.64 throughput=1174.74
+  flash_prefill_vs_base: TTFT +53.1% | prefill +113.2% | throughput -13.1%
+  graph_vs_base       : TTFT -35.1% | ITL +63.7% | throughput +144.7%
+  full_stack_vs_base  : TTFT +62.2% | ITL +64.4% | prefill +164.7% | throughput +180.0%
+
+JSONL saved to: /home/xhk/nanovllm_self/results/prefill_graph_matrix.jsonl
+Markdown summary saved to: /home/xhk/nanovllm_self/results/prefill_graph_matrix_summary.md

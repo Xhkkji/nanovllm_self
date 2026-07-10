@@ -6,7 +6,7 @@ class Context:
     """
     一个context对应一个batch，可能对应多个seq
     """
-    is_prefill: bool = False
+    # is_prefill: bool = False
     # Batch 中有 3 个序列，Query 长度分别为 [3, 5, 2]
     # cu_seqlens_q = [0, 3, 8, 10]
     #                ↑  ↑  ↑  ↑
@@ -26,18 +26,24 @@ class Context:
     max_seqlen_k: int = 0
     # slot_mapping：将当前批次中每个 token 的逻辑位置，映射到它在物理 KV 缓存池中的具体存储位置
     slot_mapping: torch.Tensor | None = None  # 逻辑 token 位置 → 物理 KV Cache 位置的映射
-    # context_lens = [] 用于收集批次中每个序列当前的上下文长度
+    # context_lens：每条 seq 当前完整可见的 KV 长度。
+    # 在统一调度下：
+    # - chunked prefill 时，等于 prefix + 本轮新增
+    # - decode 时，等于当前完整历史长度
     context_lens: torch.Tensor | None = None  # 每个序列已有的上下文长度（历史 token 数）
     # 针对当前这批seqs所有seq的blocktable，补齐长度的二维blocktable矩阵，用于查找
     block_tables: torch.Tensor | None = None
+    seq_need_compute_logits: torch.Tensor | None = None
 
 
-def get_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, block_tables=None):
-    return Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables)
-
-def print_context():
-    print(f'is_prefill:{is_prefill}')
-    print(f'is_prefill:{is_prefill}')
-    print(f'is_prefill:{is_prefill}')
-    print(f'is_prefill:{is_prefill}')
-    print(f'is_prefill:{is_prefill}')
+def get_context(cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, block_tables=None, seq_need_compute_logits=None):
+    return Context(
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        slot_mapping=slot_mapping,
+        context_lens=context_lens,
+        block_tables=block_tables,
+        seq_need_compute_logits=seq_need_compute_logits,
+    )

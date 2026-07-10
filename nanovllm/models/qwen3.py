@@ -50,11 +50,62 @@ class QwenDecoderLayer(nn.Module):
         # PagedAttention
         self.p_attn = PagedAttention(num_heads, self.num_kv_heads, self.head_dim)
 
+    def forward(self, x, positions, rotary_embedding, context):
+        """
+        通用入口，不再区分prefill和decode
+        统一前向：
+        x: [total_new_tokens, hidden_size]
+        """
+        residual = x
+        x = self.ln1(x)
+        # x.shape: [token_len, hidden_size]
+        total_new_tokens = x.size(0)
+        seq_len, encode_dim = x.shape
+        # x = x.view(batch * seq_len(total_new_tokens), encode_dim)  # 展平为[batch*seq_len, hidden_size]，一次性投影所有token
+        q = self.q_proj(x).view(total_new_tokens, self.num_heads, self.head_dim)  # [seq_len, num_heads, head_dim]
+        k = self.k_proj(x).view(total_new_tokens, self.num_kv_heads, self.head_dim)  # [seq_len, num_kv_heads, head_dim]
+        v = self.v_proj(x).view(total_new_tokens, self.num_kv_heads, self.head_dim)  # [seq_len, num_kv_heads, head_dim]
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        # 旋转位置编码
+        q, k = rotary_embedding(positions, q, k)
+
+        # if self.num_heads != self.num_kv_heads:
+        #     # GQA 复制 KV 头以匹配 Q 头数
+        #     groups = self.num_heads // self.num_kv_heads
+        #     k = k.repeat_interleave(groups, dim=1)  # [seq_len, num_heads, head_dim], 扩充num_heads
+        #     v = v.repeat_interleave(groups, dim=1)  # [seq_len, num_heads, head_dim]
+        # q = q.permute(1, 0, 2)  # [num_heads, seq_len, head_dim]
+        # k = k.permute(1, 0, 2)
+        # v = v.permute(1, 0, 2)  
+
+        # 直接调用forward通用接口，不分prefill和decode
+        # 在p_attn中保存kvcache
+        attn_output = self.p_attn(q, k, v, context)     
+        # 统一：attn_out:[total_new_tokens, num_heads, head_dims]
+        attn_output = attn_output.contiguous().view(total_new_tokens, self.num_heads * self.head_dim)  # [total_new_tokens, hidden_size]
+        attn_output = self.o_proj(attn_output)  # [total_new_tokens]
+        x = attn_output + residual  # 残差连接
+
+        residual = x
+        x = self.ln2(x)
+        # SwiGLU
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        x = F.silu(gate) * up
+        x = self.down_proj(x)
+        x = residual + x
+        # 统一主链下始终保持 [total_new_tokens, hidden_size] 形状；
+        # 不能在单 token 场景把 batch/token 维挤掉，否则下一层会收到 1D 张量。
+        return x
+
 
     def prefill(self, x, positions, rotary_embedding, context):
         """
         prefill阶段一次性处理整个输入序列，计算并存储所有的kv
-        
+        暂且废弃不用
         """
         residual = x
         x = self.ln1(x)
@@ -81,7 +132,10 @@ class QwenDecoderLayer(nn.Module):
         # v = v.permute(1, 0, 2)  
 
         attn_output = self.p_attn.prefill(q, k, v, context)     
-        attn_output = attn_output.permute(1, 0, 2).contiguous().view(seq_len, self.num_heads * self.head_dim)  # [seq_len, hidden_size]
+        # 统一：attn_out:[seq_len, num_heads, head_dims]
+        # attn_output = attn_output.permute(1, 0, 2).contiguous().view(seq_len, self.num_heads * self.head_dim)  # [seq_len, hidden_size]
+        attn_output = attn_output.contiguous().view(seq_len, self.num_heads * self.head_dim)  # [seq_len, hidden_size]
+        
         attn_output = self.o_proj(attn_output)  # [seq_len]
         x = attn_output + residual  # 残差连接
 
@@ -97,9 +151,10 @@ class QwenDecoderLayer(nn.Module):
         return x
 
 
-    def forward(self, x, positions, rotary_embedding, context):
+    def decode(self, x, positions, rotary_embedding, context):
         """
         需要处理batch维度
+        前forward函数。暂废弃不用
         """
         residual = x
         x = self.ln1(x)
@@ -242,30 +297,26 @@ class Qwen3Model(nn.Module):
         # print(f"[DEBUG] forward: self.hidden_size={self.hidden_size}")
         # print(f"[DEBUG] forward: x.shape={x.shape}")
 
-        if context.is_prefill:
-            # prefill
-            # x.shape:torch.Size([token_len, embeding_size])
-            print(f"prefill..")
-            for layer in self.layers:
-                x = layer.prefill(x, positions=positions, rotary_embedding=self.rotary_embedding, context=context)
-            # x : [total_new_tokens, hidden_size]
-            # print(f"[DEBUG] prefill forward: after layers, x.shape={x.shape}")
-        
-            
-        else:
-            # decode阶段，token_ids: [batch]，即一批seq的所有最后元素
-            for layer in self.layers:
-                x = layer.forward(x, positions=positions, rotary_embedding=self.rotary_embedding, context=context)  # Transformer前向过程中保存了kv
-            # x :[num_seqs, vocab_size]
-            # print(f"[DEBUG] decode forward: after layers, x.shape={x.shape}")
-            
+
+        # x.shape:torch.Size([token_len, embeding_size])
+        for layer in self.layers:
+            x = layer.forward(x, positions=positions, rotary_embedding=self.rotary_embedding, context=context)
+        # print(f"[DEBUG] prefill forward: after layers, x.shape={x.shape}")
+
         # x : [total_new_tokens, hidden_size]
         x = self.norm(x)
-        if context.is_prefill:
+
+        # 只保留需要logit运算的seq
+        if context.seq_need_compute_logits.numel() > 0:
             # 取出每条seq的最后一个token
-            last_indice = context.cu_seqlens_q[1:] - 1
+            # context.seq_need_compute_logits + 1:cu_sl_q存的是每个seq的起始位置
+            # 取第seqi时，cu[i+1]是seqi+1的起始位置，再-1就是seqi的最后一个token
+            last_indice = context.cu_seqlens_q[context.seq_need_compute_logits + 1] - 1
             # x :[num_seqs, vocab_size]
             x = x[last_indice].contiguous()
+        else:
+            # 没有任何序列需要计算 logits
+            x = x[:0]  # 返回空张量
 
         logits = self.lm_head(x)
         # 此处没有batch维度

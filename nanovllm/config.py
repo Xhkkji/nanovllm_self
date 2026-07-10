@@ -17,3 +17,6 @@ class Config:
     kvcache_block_size: int = 16
     use_cache: bool = True
     eos: int = -1
+    # chunk prefill
+    enable_chunked_prefill: bool = False
+    prefill_chunk_size: int = 256

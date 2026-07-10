@@ -1,0 +1,56 @@
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+[short] bs=1 gen=64 decode=flashattn cuda_graph=off
+  torch prefill: TTFT=25.31 ms prefill_tok/s=276.59 throughput=55.81
+  flash prefill: TTFT=20.50 ms prefill_tok/s=341.53 throughput=56.51
+  delta        : TTFT +19.0% | prefill +23.5% | throughput +1.2%
+
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+[short] bs=8 gen=64 decode=flashattn cuda_graph=off
+  torch prefill: TTFT=71.45 ms prefill_tok/s=783.72 throughput=406.90
+  flash prefill: TTFT=20.96 ms prefill_tok/s=2671.14 throughput=428.27
+  delta        : TTFT +70.7% | prefill +240.8% | throughput +5.3%
+
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+[medium] bs=1 gen=64 decode=flashattn cuda_graph=off
+  torch prefill: TTFT=32.57 ms prefill_tok/s=767.47 throughput=47.61
+  flash prefill: TTFT=20.76 ms prefill_tok/s=1203.96 throughput=56.21
+  delta        : TTFT +36.3% | prefill +56.9% | throughput +18.1%
+
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+[medium] bs=8 gen=64 decode=flashattn cuda_graph=off
+  torch prefill: TTFT=56.62 ms prefill_tok/s=3532.05 throughput=417.36
+  flash prefill: TTFT=20.46 ms prefill_tok/s=9776.35 throughput=430.00
+  delta        : TTFT +63.9% | prefill +176.8% | throughput +3.0%
+
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+[long] bs=1 gen=64 decode=flashattn cuda_graph=off
+  torch prefill: TTFT=26.68 ms prefill_tok/s=2136.55 throughput=55.12
+  flash prefill: TTFT=21.02 ms prefill_tok/s=2712.07 throughput=56.02
+  delta        : TTFT +21.2% | prefill +26.9% | throughput +1.6%
+
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+[long] bs=8 gen=64 decode=flashattn cuda_graph=off
+  torch prefill: TTFT=74.54 ms prefill_tok/s=6117.20 throughput=374.45
+  flash prefill: TTFT=20.56 ms prefill_tok/s=22174.58 throughput=427.98
+  delta        : TTFT +72.4% | prefill +262.5% | throughput +14.3%
+
+JSONL saved to: /home/xhk/nanovllm_self/results/prefill_backend_benchmark.jsonl
+Markdown summary saved to: /home/xhk/nanovllm_self/results/prefill_backend_benchmark_summary.md

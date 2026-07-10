@@ -1,0 +1,6 @@
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+use_multi_seq_test..
+seq1 tokens: [3838, 374, 264, 3460, 4128, 1614, 30]
+seq2 tokens: [4340, 1558, 264, 42578, 1614, 975, 30]
+input_tensor shape: torch.Size([2, 7])

@@ -1,0 +1,47 @@
+===== bs=1 =====
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+=== Reuse Check ===
+prompt=short bs=1 gen=32
+graph warmup count: 1
+first : TTFT(ms)=1435.82 ITL(ms)=18.73 decode_tok/s=55.11
+second: TTFT(ms)=24.66 ITL(ms)=6.05 decode_tok/s=170.69
+
+=== Captured Stdout ===
+graph warmup for bs=1..
+
+===== bs=2 =====
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+=== Reuse Check ===
+prompt=short bs=2 gen=32
+graph warmup count: 1
+first : TTFT(ms)=1587.21 ITL(ms)=25.36 decode_tok/s=81.40
+second: TTFT(ms)=29.36 ITL(ms)=6.34 decode_tok/s=325.60
+
+=== Captured Stdout ===
+graph warmup for bs=2..
+
+===== bs=4 =====
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+=== Reuse Check ===
+prompt=medium bs=4 gen=32
+graph warmup count: 1
+first : TTFT(ms)=1290.75 ITL(ms)=25.20 decode_tok/s=163.88
+second: TTFT(ms)=39.93 ITL(ms)=6.40 decode_tok/s=645.30
+
+=== Captured Stdout ===
+graph warmup for bs=4..
+
+===== bs=8 =====
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+=== Reuse Check ===
+prompt=medium bs=8 gen=32
+graph warmup count: 1
+first : TTFT(ms)=1299.43 ITL(ms)=26.37 decode_tok/s=313.16
+second: TTFT(ms)=71.63 ITL(ms)=6.54 decode_tok/s=1263.08
+
+=== Captured Stdout ===
+graph warmup for bs=8..

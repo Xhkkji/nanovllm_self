@@ -1,0 +1,55 @@
+采样链路实测结果
+
+测试时间
+- 当前会话内直接实测
+
+测试方式
+- 不修改现有代码
+- 先测 Sampler 本身
+- 再测真实生成链路
+
+Sampler 本身
+- SAMPLER_GREEDY = [1, 0]
+  说明：temperature = [0.0, 0.0] 时，输出等于逐行 argmax
+
+- SAMPLER_MIXED = [1, 0]
+  说明：temperature = [0.0, 0.7] 时，仍然输出逐行 argmax
+  结论：当前“只要 batch 中有一个 temperature <= 0，就整批走 greedy”的逻辑生效
+
+- SAMPLER_SAMPLE = [1, 0]
+  说明：temperature = [0.7, 1.2] 时可以正常返回结果
+  注意：这一项只说明采样分支能跑通，单次结果本身不用于判断随机性
+
+真实生成链路
+
+1. 单 seq，temperature = 0
+- E2E_SINGLE_GREEDY_SAME = True
+- 结论：greedy 路径稳定，多次运行结果一致
+
+2. 单 seq，temperature = 0.7
+- E2E_SINGLE_SAMPLE_SAME_SEED_EQUAL = True
+- E2E_SINGLE_SAMPLE_DIFF_SEED_EQUAL = False
+- E2E_SINGLE_SAMPLE_VS_GREEDY_EQUAL = False
+- 结论：
+  - 采样路径已进入
+  - 同 seed 可复现
+  - 不同 seed 会变化
+  - 采样结果不同于 greedy
+
+3. 多 seq，混合 temperature
+- E2E_BATCH_MIXED_EQUALS_BATCH_GREEDY = True
+- 结论：只要 batch 中存在一个 temperature = 0，整批都按 greedy 行为执行
+
+4. 多 seq，全部 temperature > 0
+- E2E_BATCH_SAMPLE_SAME_SEED_EQUAL = True
+- E2E_BATCH_SAMPLE_DIFF_SEED_EQUAL = False
+- 结论：
+  - 多 seq 采样路径正常
+  - 同 seed 可复现
+  - 不同 seed 会变化
+
+总体结论
+- 你当前不修改的 temperature 逻辑，和你之前定义的行为是一致的
+- 采样链路目前没有发现 shape 错误、batch 串扰或明显异常
+- 从功能正确角度看，采样链路已经基本可用
+

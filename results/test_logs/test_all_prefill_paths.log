@@ -1,0 +1,27 @@
+===== torch prefill + flash decode: single =====
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+graph warmup for bs=1..
+
+===== torch prefill + flash decode: multi =====
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+graph warmup for bs=2..
+
+===== flash prefill + flash decode: single =====
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+graph warmup for bs=1..
+
+===== flash prefill + flash decode: multi =====
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+graph warmup for bs=2..
+
+===== prefix prefill long: target_a =====
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+
+===== prefix prefill long: target_b =====
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!

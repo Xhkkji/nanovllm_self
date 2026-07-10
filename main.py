@@ -22,7 +22,7 @@ if use_self == False:
     print(f'using time:{end_time - start_time}')
     print(llm.decode(all_tokens))
 else:
-    llm = LLM_self()
+    llm = LLM_self(enable_profile=True)
 
     if use_multi_seq_test:
         print(f'use_multi_seq_test..')

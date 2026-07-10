@@ -1,0 +1,16 @@
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights:  12%|█▏        | 38/311 [00:00<00:00, 373.96it/s]Loading weights:  56%|█████▋    | 175/311 [00:00<00:00, 951.08it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 1044.27it/s]
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights:   1%|          | 2/311 [00:00<00:16, 18.43it/s]Loading weights:  40%|███▉      | 124/311 [00:00<00:00, 701.12it/s]Loading weights:  73%|███████▎  | 226/311 [00:00<00:00, 839.50it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 790.31it/s]
+0it [00:00, ?it/s]28it [00:00, 8573.55it/s]
+test_multi_seq_greedy_matches_hf (__main__.FlashDecodeCompareWithHFTest.test_multi_seq_greedy_matches_hf) ... The following generation flags are not valid and may be ignored: ['temperature', 'top_p', 'top_k']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+ok
+test_single_seq_greedy_matches_hf (__main__.FlashDecodeCompareWithHFTest.test_single_seq_greedy_matches_hf) ... ✅ Weight loading completed!
+graph warmup..
+  0%|          | 0/3 [00:00<?, ?it/s] 33%|███▎      | 1/3 [00:00<00:00,  3.85it/s]100%|██████████| 3/3 [00:00<00:00,  8.99it/s]
+ok
+
+----------------------------------------------------------------------
+Ran 2 tests in 11.349s
+
+OK

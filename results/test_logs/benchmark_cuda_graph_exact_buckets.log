@@ -1,0 +1,41 @@
+=== Case: prompt=short bs=1 gen=64 ===
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+graph warmup for bs=1..
+baseline: TTFT(ms)=24.79 ITL(ms)=17.55 decode_tok/s=57.89 throughput_tok/s=56.62
+graph   : TTFT(ms)=32.97 ITL(ms)=6.13 decode_tok/s=165.85 throughput_tok/s=152.79
+delta   : ITL +65.1% | decode +186.5% | throughput +169.9%
+
+=== Case: prompt=short bs=2 gen=64 ===
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+graph warmup for bs=2..
+baseline: TTFT(ms)=29.69 ITL(ms)=18.36 decode_tok/s=110.63 throughput_tok/s=107.87
+graph   : TTFT(ms)=30.42 ITL(ms)=6.33 decode_tok/s=320.86 throughput_tok/s=298.13
+delta   : ITL +65.5% | decode +190.0% | throughput +176.4%
+
+=== Case: prompt=medium bs=4 gen=64 ===
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+graph warmup for bs=4..
+baseline: TTFT(ms)=39.24 ITL(ms)=18.39 decode_tok/s=220.96 throughput_tok/s=213.72
+graph   : TTFT(ms)=53.28 ITL(ms)=6.50 decode_tok/s=624.70 throughput_tok/s=552.83
+delta   : ITL +64.6% | decode +182.7% | throughput +158.7%
+
+=== Case: prompt=medium bs=8 gen=64 ===
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+开始加载权重:/home/xhk/model/Qwen3-0.6B/
+✅ Weight loading completed!
+graph warmup for bs=8..
+baseline: TTFT(ms)=56.48 ITL(ms)=18.42 decode_tok/s=441.24 throughput_tok/s=420.76
+graph   : TTFT(ms)=57.88 ITL(ms)=6.52 decode_tok/s=1246.02 throughput_tok/s=1092.18
+delta   : ITL +64.6% | decode +182.4% | throughput +159.6%
+
+Results saved to: /home/xhk/nanovllm_self/results/cuda_graph_exact_buckets.jsonl

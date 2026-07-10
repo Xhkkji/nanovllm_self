@@ -1,6 +1,7 @@
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 from tqdm import tqdm
+from time import perf_counter
 from nanovllm.config import Config
 from ..models.qwen3 import Qwen3Model
 from transformers import AutoConfig
@@ -8,6 +9,7 @@ from nanovllm.engine.block_manager import block_manager as bm
 from nanovllm.engine.Sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.sampling_params import SamplingParams
 
 config = Config(
     model_path="/home/xhk/model/Qwen3-0.6B/",
@@ -15,7 +17,7 @@ config = Config(
     max_num_batched_tokens=16384,  # 每批最多 16384 tokens
     max_model_len=4096,            # 每个请求最长 4096 tokens
     gpu_memory_utilization=0.9,    # 使用 90% 显存
-    block_size=16,         # PagedAttention 块大小
+    block_size=256,         # PagedAttention 块大小
     device="cuda:0"
 )
 
@@ -83,75 +85,128 @@ class llm_engine():
     return self.tokenizer.decode(all_tokens[0], skip_special_tokens=True)
 
 class llm_engine_self():
-  def __init__(self, tensor_parallel_size=1):
-    # self.text = text
-    print("llm_engine_self..")
+  def __init__(self, tensor_parallel_size=1, enable_profile=False):
+    # print("llm_engine_self..")
     self.tokenizer = AutoTokenizer.from_pretrained('/home/xhk/model/Qwen3-0.6B')
-    # model_config = AutoConfig.from_pretrained("/home/xhk/model/Qwen3-0.6B/")
-    # self.model = Qwen3Model(model_config).to(config.device)
     self.config = config
     self.tensor_parallel_size = tensor_parallel_size
+    self.enable_profile = enable_profile
     self.eos_token_id = self.tokenizer.eos_token_id
 
-    # """
-    # generate处理的是一整个流程，bm和seq应该在这里创建
-    # """
-    # print("\n创建 BlockManager...")
-    # self.block_manager = bm(
-    #     num_blocks=self.config.num_blocks,
-    #     block_size=self.config.block_size,
-    #     num_layers=self.model.num_layers,
-    #     num_kv_heads=self.model.num_kv_heads,
-    #     head_dim=self.model.head_dim
-    # )
-    # print("✅ BlockManager 创建成功")
     self.model_runner = ModelRunner(config)
     self.scheduler = Scheduler(config, self.model_runner.block_manager)
-    
+  
+  def _set_attention_profile(self, enabled: bool):
+    """
+    把profile开关传入p_attn
+    """
+    for layer in self.model_runner.model.layers:
+        layer.p_attn.enable_profile = enabled
 
   def encoder(self, text):
     return self.tokenizer(text)
   
-  def generate(self, inputs):
+  def generate(self, inputs, sampling_params=None, return_metrics=False):
+    if sampling_params is None:
+      sampling_params = [SamplingParams()] * len(inputs)
+    
     all_seqs = []
-    finished_seqs = []
-    print("\n创建Sequence...")
-    print(f"  Prompt tokens: {inputs}")
+    # print("\n创建Sequence...")
+    # print(f"  Prompt tokens: {inputs}")
     for i, input in enumerate(inputs):
-      seq = Sequence(seq_idx=i, token_ids=input.tolist(), block_size=self.config.block_size)  # 取出 token 列表,没有batch维度
+      seq = Sequence(seq_idx=i, token_ids=input.tolist(), sampling_params=sampling_params[i], block_size=self.config.block_size)  # 取出 token 列表,没有batch维度
       self.scheduler.add(seq)
       all_seqs.append(seq)
+    
+    # 设置attention中是否要输出profile
+    self._set_attention_profile(self.enable_profile)
 
     # pbar = tqdm(total=seq.max_tokens, desc="Generating", dynamic_ncols=True)
     # 多 seq 时，进度条总量用所有 seq 的 max_tokens 总和更合理
     total_max_tokens = sum(seq.max_tokens for seq in all_seqs)
+    total_prompt_tokens = sum(seq.num_prompt_tokens for seq in all_seqs)
     pbar = tqdm(total=total_max_tokens, desc="Generating", dynamic_ncols=True)
+    total_time = 0.0
+    schedule_steps = 0
+    measure_timing = self.enable_profile or return_metrics
 
     with torch.inference_mode():
       while not self.scheduler.is_finished():
         # 统计本轮调度前，所有 seq 一共已经生成了多少 completion token
         prev_completion = sum(seq.num_completion_tokens for seq in all_seqs)
 
-        seq_list, is_prefill = self.scheduler.schedule()  # 此处已经对seq的token分配了block
-        seq_next_tokens = self.model_runner.run(seq_list, is_prefill)
+        seqs = self.scheduler.schedule()  # 此处已经对seq的token分配了block
+        if measure_timing:
+          torch.cuda.synchronize()
+          t0 = perf_counter()
+        token_ids, seq_need_compute_logits = self.model_runner.run(seqs)
+        if measure_timing:
+          torch.cuda.synchronize()
+          total_time += perf_counter() - t0
+          schedule_steps += 1
         # 规范化处理，保证加入seq的是列表而不是tensor
-        if isinstance(seq_next_tokens, torch.Tensor):
-          seq_next_tokens = seq_next_tokens.squeeze(-1).tolist()
-        seq_next_tokens = [int(x) for x in seq_next_tokens]
-        # print(seq_next_tokens, [type(x) for x in seq_next_tokens])
+        if isinstance(token_ids, torch.Tensor):
+          token_ids = token_ids.reshape(-1).tolist()
+        token_ids = [int(x) for x in token_ids]
+        # print(token_ids, [type(x) for x in token_ids])
 
         # 将新生成的token加入seq，并根据block是否已满更新block，下一轮训练会将新token的kv存入kvcache
-        self.scheduler.postprocess(seq_list, seq_next_tokens)# 更新 seq 的 token 列表，供 block_manager 存储 KV 时使用
+        self.scheduler.postprocess(seqs, token_ids, seq_need_compute_logits)# 更新 seq 的 token 列表，供 block_manager 存储 KV 时使用
         new_completion = sum(seq.num_completion_tokens for seq in all_seqs)
         
         pbar.update(new_completion - prev_completion)
-      # output = []
-      # for seq in finished_seqs:
-      #   output.append(seq.token_ids)
 
     pbar.close()
+    if self.enable_profile:
+      avg_schedule_step = total_time / schedule_steps if schedule_steps > 0 else 0.0
+      total_store = sum(layer.p_attn.profile_decode["store"] for layer in self.model_runner.model.layers)
+      total_load = sum(layer.p_attn.profile_decode["load"] for layer in self.model_runner.model.layers)
+      total_attn = sum(layer.p_attn.profile_decode["attn"] for layer in self.model_runner.model.layers)
+      total_gqa_expand = sum(layer.p_attn.profile_decode["gqa_expand"] for layer in self.model_runner.model.layers)
+      total_permute = sum(layer.p_attn.profile_decode["permute"] for layer in self.model_runner.model.layers)
+      total_qk = sum(layer.p_attn.profile_decode["qk"] for layer in self.model_runner.model.layers)
+      total_softmax = sum(layer.p_attn.profile_decode["softmax"] for layer in self.model_runner.model.layers)
+      total_av = sum(layer.p_attn.profile_decode["av"] for layer in self.model_runner.model.layers)
+      total_calls = sum(layer.p_attn.profile_decode["calls"] for layer in self.model_runner.model.layers)
+      print(
+        f"[PROFILE] schedule_steps={schedule_steps} "
+        f"avg_step={avg_schedule_step:.6f}s "
+        f"total={total_time:.4f}s"
+      )
+      print(
+        f"[PROFILE][ATTN] store_kv={total_store:.4f}s "
+        f"get_kv={total_load:.4f}s "
+        f"attn={total_attn:.4f}s "
+        f"layer_calls={total_calls}"
+      )
+      print(
+        f"[PROFILE][ATTN][DETAIL] "
+        f"gqa_expand={total_gqa_expand:.4f}s "
+        f"permute={total_permute:.4f}s "
+        f"qk={total_qk:.4f}s "
+        f"softmax={total_softmax:.4f}s "
+        f"av={total_av:.4f}s"
+      )
     output = [seq.token_ids for seq in all_seqs]
-    return output
+    if not return_metrics:
+      return output
+
+    total_generated_tokens = sum(seq.num_completion_tokens for seq in all_seqs)
+    metrics = {
+      "prefill_backend": self.model_runner.model.layers[0].p_attn.prefill_backend,
+      "decode_backend": self.model_runner.model.layers[0].p_attn.decode_backend,
+      "num_seqs": len(all_seqs),
+      "prompt_tokens": total_prompt_tokens,
+      "generated_tokens": total_generated_tokens,
+      "total_time_s": total_time,
+      "schedule_steps": schedule_steps,
+      "avg_step_ms": (total_time / schedule_steps) * 1000.0 if schedule_steps > 0 else 0.0,
+      "throughput_tok_s": total_generated_tokens / total_time if total_time > 0 else 0.0,
+    }
+    return {
+      "outputs": output,
+      "metrics": metrics,
+    }
 
       
     # seq = None
@@ -228,5 +283,5 @@ class llm_engine_self():
 
   def decode(self, all_tokens):
     # return self.tokenizer.decode(all_tokens)
-    print(f'Decoding all_tokens:{all_tokens}')
+    # print(f'Decoding all_tokens:{all_tokens}')
     return self.tokenizer.decode(all_tokens, skip_special_tokens=True)

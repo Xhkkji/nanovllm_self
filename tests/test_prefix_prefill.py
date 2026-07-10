@@ -26,7 +26,7 @@ class PrefixPrefillTest(unittest.TestCase):
             max_num_batched_tokens=16384,
             max_model_len=4096,
             gpu_memory_utilization=0.9,
-            block_size=16,
+            block_size=256,
             num_blocks=256,
         )
         cls.tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)

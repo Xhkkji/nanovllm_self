@@ -17,11 +17,15 @@ class Sequence:
         self.token_ids = token_ids
         self.token_len = len(token_ids)
         self.last_token = token_ids[-1]
+        
         self.block_table = []  # 物理块ID列表
         self.block_size = block_size
         # num_prompt_tokens 看作一个序列的初始尺寸，而 num_cached_tokens 是一个进度指针，记录已经往前推进了多少
-        self.num_prompt_tokens = len(token_ids)  # prompt 长度,全程不变，用于计算已经生成token的数量
+        self.num_prompt_tokens = len(token_ids)  # prompt 长度,全程不变，用于计算用于prefill的token的数量
         self.num_cached_tokens = 0  # 初始为 0， 记录有多少 token 已经存在于 KV Cache 中（通过前缀共享获得），不需要重复计算。
+        # 本轮打算推进多少token
+        self.num_new_tokens = 0
+        
         self.finished = False  # 是否完成
         self.status = SequenceStatus.WAITING
         
@@ -49,6 +53,24 @@ class Sequence:
         self.last_token = self.token_ids[-1]
 
     @property
+    def num_prompt_remaining_tokens(self):
+        """
+        # 还没 prefill 进 cache 的 prompt token 数
+        """
+        return self.num_prompt_tokens - self.num_cached_tokens
+
+    @property
+    def is_prefill_done(self):
+        # prompt 是否已经全部进 cache
+        return self.num_cached_tokens >= self.num_prompt_tokens
+    
+    @property
+    def num_context_tokens(self):
+        # 当前这轮 attention 可见的完整历史长度
+        # num_context_tokens 是“这轮 q 对应能看到的完整 k/v 长度”
+        return self.num_cached_tokens + self.num_new_tokens
+
+    @property
     def num_blocks(self):
         return (len(self.token_ids) + self.block_size - 1) // self.block_size
 
@@ -66,3 +88,9 @@ class Sequence:
     @property
     def num_completion_tokens(self):
         return len(self.token_ids) - self.num_prompt_tokens
+
+    @property
+    def is_need_logits(self):
+        #  用来决定 这轮哪些 seq 要采样
+        # 当本轮已经推进到当前 token_ids 的末尾时，才需要为这条 seq 采样下一个 token
+        return self.num_context_tokens == len(self.token_ids)
