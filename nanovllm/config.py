@@ -7,7 +7,16 @@ import torch
 class Config:
     model_path: str
     device: str = "cuda:0"
+
     dtype: torch.dtype = torch.float16
+    # 新增：KV cache 单独的存储 dtype
+    kv_cache_dtype: torch.dtype = torch.bfloat16
+    # 新增：attention 计算时 q/k/v 使用的 dtype
+    attention_compute_dtype: torch.dtype = torch.bfloat16
+    # 新增：decode flash 的实现方式
+    # 可选: "paged_flash" / "gathered_flash" / "torch"
+    # decode_attention_backend: str = "paged_flash"
+
     max_model_len: int = 2048
     max_num_seqs: int = 256  # 一轮调度里，最多同时处理多少条序列，“并发序列数上限”
     num_blocks: int = 256

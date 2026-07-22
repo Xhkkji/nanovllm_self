@@ -29,13 +29,13 @@ def main():
 
     prompt = "What is a large language model?"
     output_token_ids = pd.generate(
-        text=prompt,
+        texts=[prompt],
         max_tokens=32,
         temperature=0.0,
         ignore_eos=True,
     )
 
-    print(tokenizer.decode(output_token_ids, skip_special_tokens=True))
+    print(tokenizer.decode(output_token_ids[0], skip_special_tokens=True))
 
 
 if __name__ == "__main__":

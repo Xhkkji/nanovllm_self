@@ -14,6 +14,7 @@ class Sequence:
     """
     def __init__(self, seq_idx: int, token_ids: list[int], sampling_params = SamplingParams(), block_size=16):
         self.seq_idx = seq_idx  # 序列id，整个token的ids
+        self.request_id = None
         self.token_ids = token_ids
         self.token_len = len(token_ids)
         self.last_token = token_ids[-1]

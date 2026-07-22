@@ -10,6 +10,8 @@ from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.llm import LLM_self
 from nanovllm.sampling_params import SamplingParams
 from pd_self.coordinator import PDCoordinator
+from pd_self.kv_connector import KVConnector
+from pd_self.kv_store import DictKVStoreBackend
 from pd_self.prefill_engine import PrefillEngine
 
 
@@ -110,7 +112,15 @@ class PDBatchEdgeCasesTest(unittest.TestCase):
 
     def _build_prefill_engine(self):
         model_runner = ModelRunner(self.config)
-        return PrefillEngine(self.config, self.tokenizer, model_runner)
+        kv_store_backend = DictKVStoreBackend()
+        kv_connector = KVConnector(
+            config=self.config,
+            role="producer",
+            engine_id="eval-prefill",
+            kv_store_backend=kv_store_backend,
+        )
+        kv_connector.register_model_runner(model_runner)
+        return PrefillEngine(self.config, self.tokenizer, model_runner, kv_connector)
 
     @unittest.expectedFailure
     def test_mixed_prompt_lengths_match_monolithic(self):
@@ -164,7 +174,7 @@ class PDBatchEdgeCasesTest(unittest.TestCase):
             self.assertEqual(len(payload.token_ids), len(prompt_ids) + 1)
             self.assertTrue(payload.finished)
             self.assertEqual(payload.num_cached_tokens, 0)
-            self.assertEqual(payload.block_table, [])
+            self.assertIsNone(payload.transfer_meta)
 
     def test_short_prompt_handoffs_no_later_than_long_prompt(self):
         prompts = [

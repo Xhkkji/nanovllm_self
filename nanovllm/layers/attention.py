@@ -17,6 +17,12 @@ class PagedAttention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.groups = num_heads // num_kv_heads if num_kv_heads > 0 else 1
         self.dtype = dtype
+
+        # 新增：存储 / 计算 / 路径 三个维度显式拆开
+        self.kv_cache_dtype = torch.float16
+        self.attention_compute_dtype = torch.float16
+        self.decode_backend = "paged_flash"
+
         # 以下在modelrunner中逐层绑定
         self.k_cache = None
         self.v_cache = None
@@ -42,19 +48,7 @@ class PagedAttention(nn.Module):
         # 以后可以扩展为：
         # "torch" / "flashattn" / "triton"
         self.kv_writer_backend = "torch"
-        self.prefill_backend = "torch"
-        self.decode_backend = "flashattn"
         self.forward_backend = "flashattn"
-        self.set_attention_backend("flashattn")
-    
-    def set_attention_backend(self, backend: str):
-        """
-        统一设置当前主链使用的 attention backend。
-        短期保留老字段，避免外部代码全改。
-        """
-        self.forward_backend = backend
-        self.prefill_backend = backend
-        self.decode_backend = backend
 
     def _should_profile(self):
         return self.enable_profile and (not self.in_cuda_graph_capture)
@@ -86,8 +80,8 @@ class PagedAttention(nn.Module):
         slot_mapping: [num_tokens]
         """
         # 逐元素运算
-        k = k.to(self.k_cache.dtype)
-        v = v.to(self.v_cache.dtype)
+        k = k.to(self.kv_cache_dtype)
+        v = v.to(self.kv_cache_dtype)
         block_id = slot_mapping // self.block_size
         offset = slot_mapping % self.block_size
 
@@ -186,12 +180,12 @@ class PagedAttention(nn.Module):
         2. 再根据 backend 选择 prefill attention 实现
         """
         self.write_kv_cache(k, v, context.slot_mapping)
-        if self.prefill_backend == "torch":
+        if self.forward_backend == "torch":
             return self.prefill_torch(q, k, v, context)
-        elif self.prefill_backend == "flashattn":
+        elif self.forward_backend == "flashattn":
             return self.prefill_flashattn(q, k, v, context)
         else:
-            raise NotImplementedError(f"unknown prefill backend: {self.prefill_backend}")
+            raise NotImplementedError(f"unknown prefill backend: {self.forward_backend}")
 
     def prefill_flashattn(self, q, k, v, context):
         """
@@ -209,12 +203,11 @@ class PagedAttention(nn.Module):
 
         out: [total_q_tokens, num_kv_heads, head_dim]
         """
-
-        q = q.to(self.k_cache.dtype)
-        k = k.to(self.k_cache.dtype)
-        v = v.to(self.v_cache.dtype)
         # 没 prefix 的情况：直接用当前局部 q/k/v
         if context.block_tables is None:
+            q = q.to(self.attention_compute_dtype)
+            k = k.to(self.attention_compute_dtype)
+            v = v.to(self.attention_compute_dtype)
             out = flash_attn_varlen_func(
                 q=q,
                 k=k,
@@ -232,6 +225,9 @@ class PagedAttention(nn.Module):
         # 而是直接用全局 cache + block_table
         # 有 prefix cache / chunked prefill / decode 历史时：
         # 直接让 flash 内核从 paged cache 中读取完整 KV
+
+        # 改进偏移问题
+        q = q.to(self.attention_compute_dtype)
         out = flash_attn_varlen_func(
             q=q,
             k=self.k_cache,

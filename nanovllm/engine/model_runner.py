@@ -37,7 +37,7 @@ class ModelRunner(nn.Module):
             self.config.block_size, 
             self.model.num_kv_heads, 
             self.model.head_dim,
-            dtype=config.dtype, 
+            dtype=config.kv_cache_dtype, 
             device=config.device
         )
         self.bind_kvcache_to_attention()
@@ -281,6 +281,11 @@ class ModelRunner(nn.Module):
             p_attn.v_cache = self.kv_cache[1, layer_id]
             p_attn.block_size = self.config.block_size
             p_attn.layer_id = layer_id
+
+            # 新增
+            p_attn.kv_cache_dtype = self.config.kv_cache_dtype
+            p_attn.attention_compute_dtype = self.config.attention_compute_dtype
+            # p_attn.decode_backend = self.config.decode_attention_backend
 
     
     def prepare_block_tables(self, seqs):

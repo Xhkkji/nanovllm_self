@@ -71,12 +71,12 @@ class CompareWithHFTest(unittest.TestCase):
 
         with torch.inference_mode():
             while not scheduler.is_finished():
-                seq_list, is_prefill = scheduler.schedule()
-                token_ids = self.model_runner.run(seq_list, is_prefill)
+                seq_list = scheduler.schedule()
+                token_ids, seq_need_compute_logits = self.model_runner.run(seq_list)
                 if isinstance(token_ids, torch.Tensor):
                     token_ids = token_ids.tolist()
                 token_ids = [int(x) for x in token_ids]
-                scheduler.postprocess(seq_list, token_ids)
+                scheduler.postprocess(seq_list, token_ids, seq_need_compute_logits)
 
         return [seq.token_ids for seq in seqs]
 

@@ -6,6 +6,8 @@ from transformers import AutoTokenizer
 
 from nanovllm.config import Config
 from nanovllm.engine.model_runner import ModelRunner
+from pd_self.kv_connector import KVConnector
+from pd_self.kv_store import DictKVStoreBackend
 from pd_self.prefill_engine import PrefillEngine
 
 
@@ -29,7 +31,15 @@ class HandoffPayloadTest(unittest.TestCase):
 
     def _build_prefill_engine(self):
         model_runner = ModelRunner(self.config)
-        return PrefillEngine(self.config, self.tokenizer, model_runner)
+        kv_store_backend = DictKVStoreBackend()
+        kv_connector = KVConnector(
+            config=self.config,
+            role="producer",
+            engine_id="eval-prefill",
+            kv_store_backend=kv_store_backend,
+        )
+        kv_connector.register_model_runner(model_runner)
+        return PrefillEngine(self.config, self.tokenizer, model_runner, kv_connector)
 
     def _payload_id(self, payload):
         if hasattr(payload, "seq_id"):
@@ -59,7 +69,10 @@ class HandoffPayloadTest(unittest.TestCase):
         self.assertEqual(payload.num_cached_tokens, len(prompt_ids))
         self.assertEqual(payload.token_ids[: len(prompt_ids)], prompt_ids)
         self.assertGreater(len(payload.token_ids), len(prompt_ids))
-        self.assertGreater(len(payload.block_table), 0)
+        self.assertIsNotNone(payload.transfer_meta)
+        self.assertGreater(payload.transfer_meta.num_kv_blocks, 0)
+        self.assertGreater(len(payload.transfer_meta.src_block_table), 0)
+        self.assertEqual(payload.transfer_meta.num_cached_tokens, len(prompt_ids))
         self.assertEqual(payload.temperature, 0.0)
         self.assertEqual(payload.max_tokens, 32)
         self.assertTrue(payload.ignore_eos)
@@ -86,7 +99,7 @@ class HandoffPayloadTest(unittest.TestCase):
         self.assertTrue(payload.finished)
         # finished 请求当前实现下已经释放 KV 相关状态
         self.assertEqual(payload.num_cached_tokens, 0)
-        self.assertEqual(payload.block_table, [])
+        self.assertIsNone(payload.transfer_meta)
 
     def test_multi_payloads_preserve_order_and_ids(self):
         prompts = [
@@ -112,7 +125,9 @@ class HandoffPayloadTest(unittest.TestCase):
             self.assertEqual(payload.num_prompt_tokens, len(prompt_ids))
             self.assertGreaterEqual(len(payload.token_ids), len(prompt_ids) + 1)
             self.assertEqual(payload.num_cached_tokens, len(prompt_ids))
-            self.assertGreater(len(payload.block_table), 0)
+            self.assertIsNotNone(payload.transfer_meta)
+            self.assertGreater(payload.transfer_meta.num_kv_blocks, 0)
+            self.assertGreater(len(payload.transfer_meta.src_block_table), 0)
             self.assertFalse(payload.finished)
 
 

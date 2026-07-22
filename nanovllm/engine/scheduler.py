@@ -4,6 +4,20 @@ from nanovllm.engine.Sequence import Sequence, SequenceStatus
 
 from collections import deque
 
+@dataclass
+class ScheduleOutput:
+    seqs: list[Sequence]
+    decode_seqs: list[Sequence]
+    prefill_seqs: list[Sequence]
+    new_prefill_seqs: list[Sequence]
+    num_decode_tokens: int
+    num_prefill_tokens: int
+    token_budget_used: int
+    token_budget_remaining: int
+    blocked_decode: int = 0
+    blocked_prefill: int = 0
+    reason: str = "ok"
+
 class Scheduler:
     def __init__(self, config, block_manager):
         self.config = config
@@ -28,104 +42,105 @@ class Scheduler:
         postprocess() 不再区分 prefill/decode 两套函数
         所有活跃 seq 都统一推进 num_cached_tokens += num_new_tokens
         当waiting队列不为空，优先处理waiting队列（需要prefill的seq） 
+        
+        20260721,schedule 支持空返回 + decode-first
+        在线推理前的优化
+        在线化前推荐调度顺序：
+        1. decode first
+        2. running prefill chunk
+        3. waiting new prefill
+
+        允许返回空列表，方便在线 engine loop 常驻运行。
         """
         # seq_list = deque()
-        scheduled_running = []
+        scheduled_decode = []
+        scheduled_prefill = []
+        # scheduled_running = []
         scheduled_new = []
-        preempted = []  # 被抢占的seq
+        # preempted = []  # 被抢占的seq
 
         num_seqs = 0
         token_budget = self.max_num_batched_tokens
 
-        # 先推进running队列，此时prefill和decode在schedule中不分
-        # req_index 是一个游标（Cursor）或索引，用于在 while 循环中记录当前正在处理 self.running 列表中的哪一条序列
-        req_index = 0
-        while req_index < len(self.running) and token_budget > 0 and num_seqs < self.max_num_seqs:
-            seq = self.running[req_index]
-            # 当前这条 seq 还需要推进多少 token
-            remaining = len(seq) - seq.num_cached_tokens
+        # 1. 优先 decode，保护 ITL / TPOT
+        for seq in list(self.running):
+            if token_budget <= 0 or num_seqs >= self.max_num_seqs:
+                break
             
-            # 查看当前seq的prefill是否进行完
             if not seq.is_prefill_done:
-                num_new_tokens = remaining
-                # 若开启chunked_prefill功能
-                if self.config.enable_chunked_prefill:
-                    num_new_tokens = min(num_new_tokens,self.config.prefill_chunk_size)
-                num_new_tokens = min(num_new_tokens, token_budget)
-            else:
-                # 如果该seq已经prefill完成，走decode，一次只推进 1 个 token
-                num_new_tokens = min(1, token_budget)
-            
-            if num_new_tokens <= 0:
-                # 处理完成，游标后移，继续处理下一个seq
-                req_index += 1
+                # 若还处于prefill
+                continue
+
+            if not self.block_manager.can_append(seq):
+                # 查看block容量是否足够
                 continue
             
-            # 只有 decode 可能需要 append 新 block
-            if seq.is_prefill_done:
-                while not self.block_manager.can_append(seq):
-                    # 从队列尾部开始抢占
-                    # 抢占会一直持续，直到 can_append或者列表长度缩减到等于当前的 req_index
-                    if self.running:
-                        preempted_seq = self.running.pop()
-                        self.preempty(preempted_seq)  # 放回wait队列
-                        preempted.append(preempted_seq)  # 调度中断的seq都在waiting队列，此处与还没有开始服务的seq作区分
-                        if len(self.running) == req_index:
-                            # 若进入这个分支，则seq[req_index]也已经被驱逐
-                            break
-                    else:
-                        break
+            self.block_manager.may_append(seq)
 
-                if len(self.running) == req_index:
-                    # 一路退出大循环
-                    # 当前的 schedule() 调用会立即终止调度过程
-                    break
-                
-                self.block_manager.may_append(seq)
+            seq.num_new_tokens = 1
+            seq.status = SequenceStatus.RUNNING
+            scheduled_decode.append(seq)
+
+            token_budget -= 1
+            num_seqs += 1
+        
+        # 2. 推进已经进入 running 的 prefill chunk
+        for seq in list(self.running):
+            if token_budget <= 0 or num_seqs >= self.max_num_seqs:
+                break
             
+            if seq.is_prefill_done:
+                continue
+
+            remaining = len(seq) - seq.num_cached_tokens
+            num_new_tokens = remaining
+
+            if self.config.enable_chunked_prefill:
+                num_new_tokens = min(num_new_tokens, self.config.prefill_chunk_size)
+
+            num_new_tokens = min(num_new_tokens, token_budget)
+
+            if num_new_tokens <= 0:
+                continue
+
             seq.num_new_tokens = num_new_tokens
             seq.status = SequenceStatus.RUNNING
-            scheduled_running.append(seq)
+            scheduled_prefill.append(seq)
 
             token_budget -= num_new_tokens
             num_seqs += 1
-            req_index += 1
 
-        # 若能进入下面逻辑，则没有抢占发生，正常执行prefill
-        if not preempted:
-            # 如果本轮调度中已经发生过抢占（即 preempted 列表不为空），则暂停接纳 waiting 队列中的新请求
-            # 为了在系统资源紧张时优先保障 已运行序列 的稳定性和公平性
-            while self.waiting and token_budget > 0 and num_seqs < self.max_num_seqs:
-                seq = self.waiting[0]
-                remaining = len(seq) - seq.num_cached_tokens
-                num_new_tokens = remaining
-                if self.config.enable_chunked_prefill:
-                    num_new_tokens = min(num_new_tokens, self.config.prefill_chunk_size)
-                num_new_tokens = min(num_new_tokens, token_budget)
+        # 3. 接纳 waiting 中的新 prefill 请求
+        while self.waiting and token_budget > 0 and num_seqs < self.max_num_seqs:
+            seq = self.waiting[0]
 
-                if num_new_tokens <= 0:
+            if not seq.block_table:
+                if not self.block_manager.can_allocate(seq):
                     break
-                
-                if not seq.block_table:
-                    if not self.block_manager.can_allocate(seq):
-                        break
-                    self.block_manager.allocate(seq)
-                
-                seq.num_new_tokens = num_new_tokens
-                seq.status = SequenceStatus.RUNNING
+                self.block_manager.allocate(seq)
 
-                self.waiting.popleft()
-                self.running.append(seq)
-                scheduled_new.append(seq)
+            remaining = len(seq) - seq.num_cached_tokens
+            num_new_tokens = remaining
 
-                token_budget -= num_new_tokens
-                num_seqs += 1
-        
-        # scheduled_running 是“续跑”的，scheduled_new 是“新跑”的。两者合并后的列表 
-        # scheduled就是本轮模型推理需要处理的所有序列
-        scheduled = scheduled_running + scheduled_new
-        assert scheduled
-        return scheduled
+            if self.config.enable_chunked_prefill:
+                num_new_tokens = min(num_new_tokens, self.config.prefill_chunk_size)
+
+            num_new_tokens = min(num_new_tokens, token_budget)
+
+            if num_new_tokens <= 0:
+                break
+
+            seq.num_new_tokens = num_new_tokens
+            seq.status = SequenceStatus.RUNNING
+
+            self.waiting.popleft()
+            self.running.append(seq)
+            scheduled_new.append(seq)
+
+            token_budget -= num_new_tokens
+            num_seqs += 1
+
+        return scheduled_decode + scheduled_prefill + scheduled_new
         
     def preempty(self, seq):
         """
@@ -154,7 +169,8 @@ class Scheduler:
                 (seq.num_completion_tokens == seq.max_tokens):
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
-                self.running.remove(seq)
+                if seq in self.running:
+                    self.running.remove(seq)
                 finished_list.append(seq)
             
         # 所有本轮参与的活跃 seq，都推进 cache 进度
@@ -165,6 +181,32 @@ class Scheduler:
 
         return finished_list
 
+    def abort(self, seq: Sequence) -> None:
+        """
+        在线请求取消 / 超时 / 异常时统一清理。
+        """
+        if seq in self.waiting:
+            self.waiting.remove(seq)
+
+        if seq in self.running:
+            self.running.remove(seq)
+        
+        self.block_manager.deallocate(seq)
+        seq.status = SequenceStatus.FINISHED
+        seq.num_new_tokens = 0
+    
+    def abort_by_seq_idx(self, seq_idx: int) -> bool:
+        for seq in list(self.waiting):
+            if seq.seq_idx == seq_idx:
+                self.abort(seq)
+                return True
+
+        for seq in list(self.running):
+            if seq.seq_idx == seq_idx:
+                self.abort(seq)
+                return True
+
+        return False
 
 
 

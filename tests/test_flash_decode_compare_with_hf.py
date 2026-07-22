@@ -39,10 +39,10 @@ class FlashDecodeCompareWithHFTest(unittest.TestCase):
         ).eval()
         cls.model_runner = ModelRunner(cls.config)
 
-        # 强制使用当前要验证的组合：torch prefill + flash decode
+        # 当前统一主链由 forward_backend 控制。
+        # 这里显式固定为 flashattn，验证当前 paged-flash 主链。
         for layer in cls.model_runner.model.layers:
-            layer.p_attn.prefill_backend = "torch"
-            layer.p_attn.decode_backend = "flashattn"
+            layer.p_attn.forward_backend = "flashattn"
 
     def _reset_runner_state(self):
         self.model_runner.kv_cache.zero_()
@@ -72,12 +72,12 @@ class FlashDecodeCompareWithHFTest(unittest.TestCase):
 
         with torch.inference_mode():
             while not scheduler.is_finished():
-                seq_list, is_prefill = scheduler.schedule()
-                token_ids = self.model_runner.run(seq_list, is_prefill)
+                seq_list = scheduler.schedule()
+                token_ids, seq_need_compute_logits = self.model_runner.run(seq_list)
                 if isinstance(token_ids, torch.Tensor):
                     token_ids = token_ids.tolist()
                 token_ids = [int(x) for x in token_ids]
-                scheduler.postprocess(seq_list, token_ids)
+                scheduler.postprocess(seq_list, token_ids, seq_need_compute_logits)
 
         return [seq.token_ids for seq in seqs]
 

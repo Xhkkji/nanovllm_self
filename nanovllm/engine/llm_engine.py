@@ -136,6 +136,9 @@ class llm_engine_self():
         prev_completion = sum(seq.num_completion_tokens for seq in all_seqs)
 
         seqs = self.scheduler.schedule()  # 此处已经对seq的token分配了block
+        if not seqs:
+          continue
+        
         if measure_timing:
           torch.cuda.synchronize()
           t0 = perf_counter()

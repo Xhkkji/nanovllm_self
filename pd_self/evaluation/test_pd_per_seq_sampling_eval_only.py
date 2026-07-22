@@ -10,6 +10,8 @@ from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.llm import LLM_self
 from nanovllm.sampling_params import SamplingParams
 from pd_self.decode_engine import DecodeEngine
+from pd_self.kv_connector import KVConnector
+from pd_self.kv_store import DictKVStoreBackend
 from pd_self.prefill_engine import PrefillEngine
 
 
@@ -75,9 +77,25 @@ class PDPerSeqSamplingEvalOnlyTest(unittest.TestCase):
         因此测试里如果想覆盖“同一 batch 内每条请求不同 max_tokens / temperature”，
         就只能绕过公开入口，直接在 evaluation 中手工构造和推进 Sequence。
         """
-        model_runner = ModelRunner(self.config)
-        prefill_engine = PrefillEngine(self.config, self.tokenizer, model_runner)
-        decode_engine = DecodeEngine(self.config, self.tokenizer, model_runner)
+        prefill_runner = ModelRunner(self.config)
+        decode_runner = ModelRunner(self.config)
+        kv_store_backend = DictKVStoreBackend()
+        prefill_connector = KVConnector(
+            config=self.config,
+            role="producer",
+            engine_id="eval-prefill",
+            kv_store_backend=kv_store_backend,
+        )
+        decode_connector = KVConnector(
+            config=self.config,
+            role="consumer",
+            engine_id="eval-decode",
+            kv_store_backend=kv_store_backend,
+        )
+        prefill_connector.register_model_runner(prefill_runner)
+        decode_connector.register_model_runner(decode_runner)
+        prefill_engine = PrefillEngine(self.config, self.tokenizer, prefill_runner, prefill_connector)
+        decode_engine = DecodeEngine(self.config, self.tokenizer, decode_runner, decode_connector)
 
         seqs = prefill_engine.build_sequences(
             texts=prompts,
@@ -124,7 +142,8 @@ class PDPerSeqSamplingEvalOnlyTest(unittest.TestCase):
 
         del decode_engine
         del prefill_engine
-        del model_runner
+        del decode_runner
+        del prefill_runner
         gc.collect()
         torch.cuda.empty_cache()
         return outputs
