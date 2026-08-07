@@ -55,7 +55,23 @@ class block_manager:
         #     num_blocks, block_size, 2, num_layers, num_kv_heads, head_dim,
         #     dtype=dtype, device=device
         # )
-    
+
+    # 【第四章收口改动】在线服务观测接口：只读 block manager 状态，不改变分配逻辑。
+    def num_free_blocks(self):
+        return len(self.free_blocks_idx)
+
+    # 【第四章收口改动】在线服务观测接口：明确返回已经占用的物理 block 数。
+    def num_used_blocks(self):
+        return len(self.used_blocks_idx)
+
+    # 【第四章收口改动】在线服务观测接口：给 coordinator/benchmark 一次性读取 KV block 用量。
+    def get_block_usage_snapshot(self):
+        return {
+            "total_blocks": self.num_blocks,
+            "used_blocks": self.num_used_blocks(),
+            "free_blocks": self.num_free_blocks(),
+        }
+
     def can_allocate(self, seq:Sequence):
         """
         prefill阶段判断剩余空间够不够装下一整个seq

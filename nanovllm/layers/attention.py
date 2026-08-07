@@ -22,6 +22,13 @@ class PagedAttention(nn.Module):
         self.kv_cache_dtype = torch.float16
         self.attention_compute_dtype = torch.float16
         self.decode_backend = "paged_flash"
+        
+        # kvcache量化
+        # kv_cache_quant_mode 控制当前 attention 如何写/读 KV cache
+        # scale_cache 只在 int8_mock 下使用
+        self.kv_cache_quant_mode = "none"
+        self.k_scale_cache = None
+        self.v_scale_cache = None
 
         # 以下在modelrunner中逐层绑定
         self.k_cache = None
@@ -52,6 +59,63 @@ class PagedAttention(nn.Module):
 
     def _should_profile(self):
         return self.enable_profile and (not self.in_cuda_graph_capture)
+
+    def quantize_int8_per_token(self, x):
+        """
+        这两个函数实现了一个非常经典的 Per-Token 对称量化（Symmetric Quantization） 方法。
+        它是在大模型推理中，为了压缩 KV Cache 而经常采用的基础技术。
+
+        简单来说，它把一个高精度的浮点数张量，映射到 int8 范围（-127 到 127）
+        并且为每一个 Token 的每一个注意力头单独计算一个缩放因子，从而在压缩内存的同时，尽可能保留精度。
+        
+        
+        这个函数的核心任务，是把输入的浮点数张量 x 压缩成 int8 整数。
+
+        输入 x：形状是 [num_tokens, num_kv_heads, head_dim]，这对应着在 Transformer 模型中，一组 Token 的 Key 或 Value 值，按注意力头分组后的表示。
+
+        计算绝对最大值 (Absmax)：x_fp32.abs().amax(dim=-1, keepdim=True)
+        这一步在 head_dim（即最后一维）上，找出每一个 Token 的每一个注意力头里，所有元素中绝对值最大的那个。keepdim=True 确保输出的形状是 [num_tokens, num_kv_heads, 1]。
+
+        计算缩放因子 (Scale)：(absmax / 127.0).clamp(min=1e-6)
+        这是量化的核心。我们想把 [-absmax, absmax] 这个范围映射到 [-127, 127]，所以缩放因子 scale = absmax / 127。加一个很小的 1e-6 是为了防止 absmax 为 0 时导致除零错误。
+
+        执行量化 (Quantization)：torch.round(x_fp32 / scale).clamp(-127, 127).to(torch.int8)
+
+        首先将每个元素除以它对应的 scale，让数值范围落到 [-127, 127] 附近。
+        round 四舍五入取整。
+        clamp 把数值截断在 -127 到 127 之间，防止极少数异常值溢出。
+        最后将数据类型转为 int8，完成内存压缩。
+        返回：返回量化后的 int8 张量 q 和计算出的 scale 张量。scale 在后续反量化时必须用到。
+        x: [num_tokens, num_kv_heads, head_dim]
+        return:
+        q:     int8  [num_tokens, num_kv_heads, head_dim]
+        scale: float [num_tokens, num_kv_heads, 1]
+        """
+        x_fp32 = x.float()
+        absmax = x_fp32.abs().amax(dim=-1, keepdim=True)
+        scale = (absmax / 127.0).clamp(min=1e-6)
+        q = torch.round(x_fp32 / scale).clamp(-127, 127).to(torch.int8)
+        return q, scale
+    
+    def dequantize_int8_per_token(self, q, scale):
+        """
+        这个函数是量化的逆过程，用于把 int8 数据还原回浮点数，以便参与如 Flash Attention 等需要浮点数运算的模块。
+
+        输入 q 和 scale：q 是量化后的 int8 张量，scale 是在量化时计算并保存的缩放因子。
+
+        执行反量化 (Dequantization)：(q.float() * scale.float()).to(self.attention_compute_dtype)
+        逻辑非常简单直接：
+
+        将 int8 的 q 转回 float 类型。
+        将 q 乘回它对应的 scale，就恢复到了原始的数值范围。
+        最后将数据类型转换为模型计算时使用的浮点类型（如 fp16 或 bf16），以便进行后续的注意力计算。
+        
+        
+        q:     int8  [*, num_kv_heads, head_dim]
+        scale: float [*, num_kv_heads, 1]
+        """
+        return (q.float() * scale.float()).to(self.attention_compute_dtype)
+    
     
     def write_kv_cache(self, k, v, slot_mapping):
         """
@@ -78,10 +142,41 @@ class PagedAttention(nn.Module):
         k: [num_tokens, num_kv_heads, head_dim]
         v: [num_tokens, num_kv_heads, head_dim]
         slot_mapping: [num_tokens]
+
+        20260724 第一版低精度 KV cache 只做 dtype cast，不做真正 int8/fp8 量化。
+        
+        20260725 int8量化
+        普通模式：
+        K/V cast 到 bf16/fp16 后直接写入 cache
+
+        int8_mock：
+        K/V 先量化成 int8
+        int8 K/V 写入 kv_cache
+        scale 写入 scale_cache
         """
+        # in8量化
+        block_id = slot_mapping // self.block_size
+        offset = slot_mapping % self.block_size
+        
+        if self.kv_cache_quant_mode == "int8_mock":
+            qk, k_scale = self.quantize_int8_per_token(k)
+            qv, v_scale = self.quantize_int8_per_token(v)
+        
+            self.k_cache[block_id, offset] = qk
+            self.v_cache[block_id, offset] = qv
+            
+            self.k_scale_cache[block_id, offset] = k_scale.to(self.k_scale_cache.dtype)
+            self.v_scale_cache[block_id, offset] = v_scale.to(self.v_scale_cache.dtype)
+            return
+        
+        
         # 逐元素运算
-        k = k.to(self.kv_cache_dtype)
-        v = v.to(self.kv_cache_dtype)
+        cache_dtype = self.k_cache.dtype
+        if k.dtype != cache_dtype:
+            k = k.to(cache_dtype)
+        if v.dtype != cache_dtype:
+            v = v.to(cache_dtype)
+
         block_id = slot_mapping // self.block_size
         offset = slot_mapping % self.block_size
 
@@ -122,12 +217,19 @@ class PagedAttention(nn.Module):
         batch_size = block_table.size(0)
         max_seqs_len = int(seq_lens.max().item())
 
+        # 若量化模式，k_cache.dtype = int8_mock
+        # k\v_batch作为最终结果需要bf16/fp16格式
+        cache_out_dtype = (
+            self.attention_compute_dtype
+            if self.kv_cache_quant_mode == "int8_mock"
+            else self.k_cache.dtype
+        )
         k_batch = torch.zeros(
             batch_size,
             max_seqs_len,
             self.num_kv_heads,
             self.head_dim,
-            dtype=self.k_cache.dtype,
+            dtype=cache_out_dtype,
             device=self.k_cache.device,
         )
 
@@ -136,7 +238,7 @@ class PagedAttention(nn.Module):
             max_seqs_len,
             self.num_kv_heads,
             self.head_dim,
-            dtype=self.v_cache.dtype,
+            dtype=cache_out_dtype,
             device=self.v_cache.device,
         )
 
@@ -146,7 +248,7 @@ class PagedAttention(nn.Module):
         dtype=torch.bool,
         device=self.k_cache.device,
         )
-  
+
         # 简化（非矢量化）
         for i in range(batch_size):
             row = block_table[i]
@@ -154,21 +256,32 @@ class PagedAttention(nn.Module):
 
             if valid_block_ids.numel() == 0:
                 continue
-            
+
             # 取出当前seq的长度
             seq_len = int(seq_lens[i].item())
 
             # 拉平为 token 维
             # [num_blocks * block_size, num_kv_heads, head_dim]
-            seq_k = self.k_cache[valid_block_ids].reshape(-1, self.num_kv_heads, self.head_dim)
-            seq_v = self.v_cache[valid_block_ids].reshape(-1, self.num_kv_heads, self.head_dim)
-            
-            seq_k = seq_k[:seq_len]
-            seq_v = seq_v[:seq_len]
+            seq_k = self.k_cache[valid_block_ids].reshape(-1, self.num_kv_heads, self.head_dim)[:seq_len]
+            seq_v = self.v_cache[valid_block_ids].reshape(-1, self.num_kv_heads, self.head_dim)[:seq_len]
+
+            if self.kv_cache_quant_mode == "int8_mock":
+                # 取出scale值，float类型
+                seq_k_scale = self.k_scale_cache[valid_block_ids].reshape(-1, self.num_kv_heads, 1)[:seq_len]
+                seq_v_scale = self.v_scale_cache[valid_block_ids].reshape(-1, self.num_kv_heads, 1)[:seq_len]
+                seq_k = self.dequantize_int8_per_token(seq_k, seq_k_scale)
+                seq_v = self.dequantize_int8_per_token(seq_v, seq_v_scale)
 
             k_batch[i, :seq_len] = seq_k
             v_batch[i, :seq_len] = seq_v
             kv_mask[i, :seq_len] = True
+
+        if self.kv_cache_quant_mode != "int8_mock":
+            compute_dtype = self.attention_compute_dtype
+            if compute_dtype is not None:
+                k_batch = k_batch.to(compute_dtype)
+                v_batch = v_batch.to(compute_dtype)
+
         return k_batch, v_batch, kv_mask
 
 
@@ -203,6 +316,25 @@ class PagedAttention(nn.Module):
 
         out: [total_q_tokens, num_kv_heads, head_dim]
         """
+        # 量化保护，flash-attn 当前不能直接吃 int8 KV cache
+        if self.kv_cache_quant_mode != "none":
+            raise RuntimeError(
+                "int8_mock KV cache does not support flash-attn; "
+                "use torch attention backend for quantization correctness tests"
+            )
+        
+        # dtype保护
+        if self.k_cache.dtype not in (torch.float16, torch.bfloat16):
+            raise RuntimeError(
+                f"flashattn only supports fp16/bf16 kv cache, got {self.k_cache.dtype}"
+            )
+
+        # dtype保护
+        if self.k_cache.dtype != self.attention_compute_dtype:
+            raise RuntimeError(
+                f"flashattn only supports the same dtype, got {self.k_cache.dtype} and {self.attention_compute_dtype}"
+            )
+
         # 没 prefix 的情况：直接用当前局部 q/k/v
         if context.block_tables is None:
             q = q.to(self.attention_compute_dtype)
@@ -264,7 +396,7 @@ class PagedAttention(nn.Module):
 
         20260703：已经更新为统一语义”的 torch attention
         """
-        
+
         # 没有prefix的时候
         if context.block_tables is None:
             cu_q = context.cu_seqlens_q  # 例如 [0, 7, 14]
@@ -286,7 +418,7 @@ class PagedAttention(nn.Module):
                     # GQA 复制 KV 头以匹配 Q 头数
                     seq_k = seq_k.repeat_interleave(self.groups, dim=1)  # [seq_len, num_heads, head_dim], 扩充num_heads
                     seq_v = seq_v.repeat_interleave(self.groups, dim=1)  # [seq_len, num_heads, head_dim]
-                
+
                 seq_q = seq_q.permute(1, 0, 2).float()  # [num_heads, seq_len, head_dim]
                 seq_k = seq_k.permute(1, 0, 2).float()
                 seq_v = seq_v.permute(1, 0, 2) .float()
@@ -300,12 +432,12 @@ class PagedAttention(nn.Module):
                 # print(f"[DEBUG] prefill: scores={scores}")
                 attn_weights = F.softmax(scores, dim=-1)  # [num_heads, seq_len, seq_len]
                 seq_output = torch.matmul(attn_weights, seq_v)  # [num_heads, seq_len, head_dim]
-                outputs.append(seq_output)    
+                outputs.append(seq_output)
 
             # 按 token 维拼回去，保持和输入展平顺序一致
             attn_output = torch.cat(outputs, dim=1)  # [num_heads, total_tokens, head_dim]
             return attn_output.permute(1, 0, 2).to(self.dtype)
-        
+
         # 有prefix的prefill
         # 2. 有 prefix / chunked prefill / decode 历史时：
         # 从全局 cache 取完整可见 KV，再按 q_len/k_len 做 mask
@@ -333,7 +465,7 @@ class PagedAttention(nn.Module):
                 # GQA 复制 KV 头以匹配 Q 头数
                 full_k = full_k.repeat_interleave(self.groups, dim=1)  # [seq_len, num_heads, head_dim], 扩充num_heads
                 full_v = full_v.repeat_interleave(self.groups, dim=1)  # [seq_len, num_heads, head_dim]
-            
+
             # 转成 attention 计算形状
             # seq_q: [seq_q_len, num_heads, head_dim] -> [num_heads, seq_q_len, head_dim]
             # full_k: [seq_k_len, num_heads, head_dim] -> [num_heads, seq_k_len, head_dim]
@@ -342,7 +474,7 @@ class PagedAttention(nn.Module):
             full_v = full_v.permute(1, 0, 2).float()
 
             scores = torch.matmul(seq_q, full_k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            
+
             q_len = seq_q.size(1)
             k_len = full_k.size(1)
 
@@ -359,7 +491,7 @@ class PagedAttention(nn.Module):
             attn_weights = F.softmax(scores, dim=-1)
             seq_out = torch.matmul(attn_weights, full_v)  # [num_heads, q_len, head_dim]
             outputs.append(seq_out)
-        
+
         # 4. 把每条 seq 的输出按原顺序拼回去
         # outputs 里每项形状: [num_heads, seq_q_len, head_dim]
         attn_output = torch.cat(outputs, dim=1)  # [num_heads, total_q_tokens, head_dim]
@@ -382,7 +514,7 @@ class PagedAttention(nn.Module):
             t0 = perf_counter()
 
         self.write_kv_cache(k, v, context.slot_mapping)
-        
+
         if should_profile:
             torch.cuda.synchronize()
             self.profile_decode["store"] += perf_counter() - t0
@@ -416,7 +548,7 @@ class PagedAttention(nn.Module):
     def forward(self, q, k, v, context):
         # 通用的接口
         return self.forward_unified(q, k, v, context)
-    
+
     def decode_flashattn(self, q, context):
         """
         FlashAttention decode 路径

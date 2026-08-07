@@ -57,10 +57,11 @@ class PrefillEngine:
         transfer_meta = None
         if not finished:
             transfer_meta = self.kv_connector.save_kv(seq)
-
+        # 在线链路里 request_id 是服务层请求 ID，不能再临时拼 req-{seq_idx}
+        request_id = getattr(seq, "request_id", None) or f"req-{seq.seq_idx}"
         return HandoffPayload(
             seq_idx=seq.seq_idx,
-            request_id=f"req-{seq.seq_idx}",
+            request_id=request_id,
             token_ids=list(seq.token_ids),
             num_prompt_tokens=seq.num_prompt_tokens,
             num_cached_tokens=seq.num_cached_tokens,
@@ -82,6 +83,8 @@ class PrefillEngine:
         temperature: float = 0.0,
         max_tokens: int = 64,
         ignore_eos: bool = True,
+        request_id: str | None = None,
+        check_admission: bool = False,
     ) -> Sequence:
         """
         创建seq并直接把seq加入到调度器里面
@@ -93,6 +96,10 @@ class PrefillEngine:
             max_tokens=max_tokens,
             ignore_eos=ignore_eos,
         )
+        seq.request_id = request_id
+        if check_admission and not self.scheduler.can_admit(seq):
+            raise RuntimeError("server overloaded: not enough KV blocks")
+
         self.scheduler.add(seq)
         return seq
 

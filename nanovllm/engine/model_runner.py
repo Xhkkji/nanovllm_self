@@ -27,23 +27,48 @@ class ModelRunner(nn.Module):
             num_kv_heads=self.model.num_kv_heads,
             head_dim=self.model.head_dim
         )
+
+        # 判断精度是否支持
+        self._validate_kv_cache_dtype()
         # print("✅ BlockManager 创建成功")
         # 分配kv_cache
         # 形状: [2(key和value), num_layers, num_blocks, block_size, num_kv_heads, head_dim]
         self.kv_cache = torch.zeros(
-            2, 
-            self.model.num_layers, 
+            2,
+            self.model.num_layers,
             self.config.num_blocks,
-            self.config.block_size, 
-            self.model.num_kv_heads, 
+            self.config.block_size,
+            self.model.num_kv_heads,
             self.model.head_dim,
-            dtype=config.kv_cache_dtype, 
+            dtype=config.kv_cache_dtype,
             device=config.device
         )
+        
+        self.kv_scale_cache = None
+        if self.config.kv_cache_quant_mode == "int8_mock":
+            # per-token-per-kv-head scale
+            # shape: [2, num_layers, num_blocks, block_size, num_kv_heads, 1]
+            #
+            # 2 表示 K / V 两份 scale：
+            #   0 -> K scale
+            #   1 -> V scale
+            #
+            # 最后一维是 1，表示每个 token、每个 kv head 共享一个 scale，
+            # 这个 scale 会 broadcast 到 head_dim。
+            self.kv_scale_cache = torch.ones(
+                2,
+                self.model.num_layers,
+                self.config.num_blocks,
+                self.config.block_size,
+                self.model.num_kv_heads,
+                1,
+                dtype=self.config.kv_cache_scale_dtype,
+                device=self.config.device,
+            )
+        
         self.bind_kvcache_to_attention()
 
         # 计算图
-
         # self.graph_bucket = [1, 2, 4, 8]
         max_bs = self.config.max_num_seqs
         self.graph_bucket = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
@@ -58,7 +83,7 @@ class ModelRunner(nn.Module):
         # self.graph_input_ids = None     # 存储输入 token ID
         # self.graph_positions = None     # 存储位置信息
         # self.graph_logits = None        # 存储输出结果
-    
+
     def init_graph_states(self):
         """
         针对bucket
@@ -87,8 +112,8 @@ class ModelRunner(nn.Module):
         )
 
         graph_seq_need_compute_logits = torch.arange(
-            batch_size, 
-            dtype=torch.int32, 
+            batch_size,
+            dtype=torch.int32,
             device=self.device,
         )
 
@@ -100,8 +125,8 @@ class ModelRunner(nn.Module):
         )
 
         graph_cu_seqlens_k = torch.zeros(
-            batch_size + 1, 
-            dtype=torch.int32, 
+            batch_size + 1,
+            dtype=torch.int32,
             device=self.device
         )
 
@@ -162,7 +187,7 @@ class ModelRunner(nn.Module):
         """
         for layer in self.model.layers:
             layer.p_attn.in_cuda_graph_capture = enabled
-        
+
     @contextmanager
     def _cuda_graph_capture_guard(self):
         self._set_attention_capture_mode(True)
@@ -172,7 +197,7 @@ class ModelRunner(nn.Module):
         finally:
             # with代码块执行完毕之后执行
             self._set_attention_capture_mode(False)
-    
+
     def select_graph_bucket(self, batch_size: int):
         """
         向上取整选择 bucket。
@@ -191,7 +216,7 @@ class ModelRunner(nn.Module):
             if batch_size <= bs:
                 return bs
         return None
-    
+
     def copy_decode_graph_to_bucket(self, state, input_ids, positions, context, real_bs: int):
         """
         把真实 decode 输入拷到固定 bucket 的静态张量里。
@@ -234,7 +259,7 @@ class ModelRunner(nn.Module):
 
         if state["captured"]:
             return
-        
+
         input_ids = state["input_ids"]
         positions = state["positions"]
         context = state["context"]
@@ -263,15 +288,17 @@ class ModelRunner(nn.Module):
         with self._cuda_graph_capture_guard():
             with torch.cuda.graph(graph):
                 state["logits"] = self.model(input_ids, positions, context)
-        
+
         state["captured"] = True
         state["graph"] = graph
-        
-        
+
+
     def bind_kvcache_to_attention(self):
         """
         把全局 kv_cache 中每一层对应的视图，提前绑定到该层的 PagedAttention 上。
         这样前向时就不用每次手动传全局 cache。
+        把全局 kv_cache 中每一层对应的视图绑定到 PagedAttention。
+        kv_cache_dtype 以实际 cache dtype 为准，避免 config/cache 不一致。
         """
         for layer_id, layer in enumerate(self.model.layers):
             # 取出对应qwendecodelayer中的p_attn
@@ -283,11 +310,21 @@ class ModelRunner(nn.Module):
             p_attn.layer_id = layer_id
 
             # 新增
+            p_attn.kv_cache_quant_mode = self.config.kv_cache_quant_mode
             p_attn.kv_cache_dtype = self.config.kv_cache_dtype
             p_attn.attention_compute_dtype = self.config.attention_compute_dtype
             # p_attn.decode_backend = self.config.decode_attention_backend
+            if self.config.kv_cache_quant_mode == "int8_mock":
+                p_attn.forward_backend = "torch"
+            
+            if self.kv_scale_cache is not None:
+                p_attn.k_scale_cache = self.kv_scale_cache[0, layer_id]
+                p_attn.v_scale_cache = self.kv_scale_cache[1, layer_id]
+            else:
+                p_attn.k_scale_cache = None
+                p_attn.v_scale_cache = None
 
-    
+
     def prepare_block_tables(self, seqs):
         """
         数据预处理和传输的过程：先将变长的块表填充成规整的矩阵
@@ -299,7 +336,7 @@ class ModelRunner(nn.Module):
         # pin_memory固定一块cpu内存，可以加速cpu到gpu的传输，noBlock为异步传输
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).to(self.config.device)
         return block_tables
-    
+
     def prepare_sampler(self, seqs:list[Sequence], context):
         temperatures = [seq.temperature for seq in seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).to(self.config.device)
@@ -325,7 +362,7 @@ class ModelRunner(nn.Module):
         max_seqlen_q = 0
         max_seqlen_k = 0
         block_tables = None
-        
+
         for seq in seqs:
             seq_len = len(seq)
             # 储存本次需要计算的新token数
@@ -355,17 +392,17 @@ class ModelRunner(nn.Module):
         # cu_seqlens_q[-1]：本轮新算的 query token 总数
         # cu_seqlens_k[-1]：本轮可见的 key/value 总长度
         # 本轮 query 比可见上下文短，说明有部分token不是新算的，命中prefix，在cache里
-        
+
         if cu_seqlen_k[-1] > cu_seqlen_q[-1]:
             # 这里block_table已经在GPU上了
             block_tables = self.prepare_block_tables(seqs)  # 把多个seq长度不相等的blocktable处理成等长的二维矩阵，方便查找
 
-        context = get_context(is_prefill=True, 
-            cu_seqlens_q=torch.tensor(cu_seqlen_q, dtype=torch.int32, device=self.device), 
-            cu_seqlens_k=torch.tensor(cu_seqlen_k, dtype=torch.int32, device=self.device), 
-            max_seqlen_q=max_seqlen_q, 
+        context = get_context(is_prefill=True,
+            cu_seqlens_q=torch.tensor(cu_seqlen_q, dtype=torch.int32, device=self.device),
+            cu_seqlens_k=torch.tensor(cu_seqlen_k, dtype=torch.int32, device=self.device),
+            max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
-            slot_mapping=torch.tensor(slot_mapping, dtype=torch.int32, device=self.device), 
+            slot_mapping=torch.tensor(slot_mapping, dtype=torch.int32, device=self.device),
             context_lens=None,
             block_tables=block_tables
             )
@@ -374,7 +411,7 @@ class ModelRunner(nn.Module):
         positions = torch.tensor(positions, dtype=torch.int64, device=self.device)
         return input_ids, positions, context
 
-        
+
     def prepare_decode(self, seqs: list[Sequence]):
         """
         从每个 seq 里取 last_token
@@ -399,22 +436,22 @@ class ModelRunner(nn.Module):
             block_id = seq.block_table[-1]
             offset = seq.last_block_num_tokens - 1
             slot_mapping.append(block_id * seq.block_size + offset)
-        
+
         block_tables = self.prepare_block_tables(seqs)
-        context = get_context(is_prefill=False, 
-            cu_seqlens_q=None, 
-            cu_seqlens_k=None, 
-            max_seqlen_q=0, 
+        context = get_context(is_prefill=False,
+            cu_seqlens_q=None,
+            cu_seqlens_k=None,
+            max_seqlen_q=0,
             max_seqlen_k=0,
-            slot_mapping=torch.tensor(slot_mapping, dtype=torch.int32, device=self.device), 
+            slot_mapping=torch.tensor(slot_mapping, dtype=torch.int32, device=self.device),
             context_lens=torch.tensor(context_lens, dtype=torch.int32, device=self.device),
             block_tables=block_tables
             )
-        
+
         input_ids = torch.tensor(input_ids, dtype=torch.int64, device=self.device)
         positions = torch.tensor(positions, dtype=torch.int64, device=self.device)
         return input_ids, positions, context
-    
+
     def prepare_model_input(self, seqs: list[Sequence]):
         """
         合并prefill和decode的数据准备过程
@@ -492,7 +529,7 @@ class ModelRunner(nn.Module):
         # input_ids:[token_len / batch]
         input_ids, positions, context = self.prepare_model_input(seqs)
         logits = self.model(input_ids, positions, context)
-        
+
         # seq_need_compute_logits存的是需要logit操作的seq_index
         # 也就是记录哪些seq是需要生成下一个token的
         if context.seq_need_compute_logits.numel() > 0:
@@ -505,35 +542,33 @@ class ModelRunner(nn.Module):
             token_ids = [int(x) for x in token_ids]
         else:
             token_ids = []
-        
+
         seq_need_compute_logits = context.seq_need_compute_logits.tolist()
         return token_ids, seq_need_compute_logits
 
+    def _validate_kv_cache_dtype(self):
+        supported = {
+            torch.float32,
+            torch.float16,
+            torch.bfloat16,
+        }
+        if self.config.kv_cache_quant_mode == "int8_mock":
+            supported.add(torch.int8)
 
-    # def run(self, seqs, is_prefill:bool):
-    #     if is_prefill:
-    #         # input_ids:[token_len]
-    #         input_ids, positions, context = self.prepare_prefill(seqs)
-    #         logits = self.model(input_ids, positions, context)
-    #     else:
-    #       # input_ids:[batch]
-    #         input_ids, positions, context = self.prepare_decode(seqs)
-    #         real_bs = input_ids.size(0)
-    #         bucket_bs = self.select_graph_bucket(input_ids.size(0)) # 选出能装下真实bs的bucket值
-    #         # 预热计算图
-    #         if self.enable_cuda_graph and bucket_bs is not None:
-    #             state = self.graph_states[bucket_bs]
-    #             if not state["captured"]:
-    #                 self.capture_decode_graph(bucket_bs)  # 更新self.graph_states对应bz的state的计算图状态
-                
-    #             self.copy_decode_graph_to_bucket(state, input_ids, positions, context, real_bs)
-                
-    #             state["graph"].replay()  # 只有此处需要cpu发起，内部执行无需其他cpu开销
-    #             logits = state["logits"][:real_bs]
-    #         else:
-    #             logits = self.model(input_ids, positions, context)
+        if self.config.kv_cache_dtype not in supported:
 
-    #     temperatures = self.prepare_sampler(seqs)
-    #     token_ids = self.sampler(logits, temperatures)
-    #     return token_ids
-        
+            raise ValueError(
+                f"unsupported kv_cache_dtype: {self.config.kv_cache_dtype}"
+            )
+
+        # flash-attn paged cache 通常只支持 fp16 / bf16。
+        # fp32 KV cache 第一版建议走 torch backend 做正确性测试。
+        if (
+            self.config.kv_cache_dtype == torch.float32
+            and getattr(self.config, "decode_backend", "flashattn") == "flashattn"
+        ):
+            print(
+                "[WARN] fp32 kv_cache_dtype may not be supported by flash-attn; "
+                "use torch attention path for fp32 correctness test."
+            )
+

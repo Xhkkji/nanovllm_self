@@ -1,9 +1,11 @@
+from dataclasses import dataclass
 from transformers import AutoConfig
 from nanovllm.engine.block_manager import block_manager as bm
 from nanovllm.engine.Sequence import Sequence, SequenceStatus
 
 from collections import deque
 
+# 【本次在线化改动】调度结果的结构化信息，给在线 coordinator / benchmark 读
 @dataclass
 class ScheduleOutput:
     seqs: list[Sequence]
@@ -28,9 +30,30 @@ class Scheduler:
 
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+
+        self.last_schedule_info = ScheduleOutput(
+            seqs=[],
+            decode_seqs=[],
+            prefill_seqs=[],
+            new_prefill_seqs=[],
+            num_decode_tokens=0,
+            num_prefill_tokens=0,
+            token_budget_used=0,
+            token_budget_remaining=self.max_num_batched_tokens,
+            reason="idle",
+        )
     
     def add(self, seq):
         self.waiting.append(seq)  # 全是需要prefill的seq
+
+    def can_admit(self, seq: Sequence) -> bool:
+        """
+        【本次在线化改动】
+        在线入口的轻量 admission check。
+        第一版先复用 block_manager 的整段 prompt 预分配能力，避免把
+        接纳策略和调度策略混在一起。
+        """
+        return self.block_manager.can_allocate(seq)
     
     def is_finished(self):
         return (not self.waiting) and (not self.running)
@@ -52,15 +75,19 @@ class Scheduler:
 
         允许返回空列表，方便在线 engine loop 常驻运行。
         """
-        # seq_list = deque()
         scheduled_decode = []
         scheduled_prefill = []
         # scheduled_running = []
         scheduled_new = []
         # preempted = []  # 被抢占的seq
 
+        blocked_decode = 0
+        blocked_prefill = 0
+
         num_seqs = 0
         token_budget = self.max_num_batched_tokens
+        # 【本次在线化改动】记录这一轮调度起始 token budget，供 last_schedule_info 统计使用
+        initial_token_budget = token_budget
 
         # 1. 优先 decode，保护 ITL / TPOT
         for seq in list(self.running):
@@ -73,12 +100,15 @@ class Scheduler:
 
             if not self.block_manager.can_append(seq):
                 # 查看block容量是否足够
+                blocked_decode += 1
+                seq.blocked_reason = "no_free_block_for_decode"
                 continue
             
             self.block_manager.may_append(seq)
 
             seq.num_new_tokens = 1
             seq.status = SequenceStatus.RUNNING
+            seq.blocked_reason = None
             scheduled_decode.append(seq)
 
             token_budget -= 1
@@ -92,7 +122,10 @@ class Scheduler:
             if seq.is_prefill_done:
                 continue
 
-            remaining = len(seq) - seq.num_cached_tokens
+            # 【本次在线化改动】prefill 只推进 prompt 还没写入 KV 的部分。
+            # 不要用 len(seq)，否则在线场景下如果 token_ids 里已经 append 了
+            # completion token，语义会偏掉。
+            remaining = seq.num_prompt_tokens - seq.num_cached_tokens
             num_new_tokens = remaining
 
             if self.config.enable_chunked_prefill:
@@ -105,6 +138,7 @@ class Scheduler:
 
             seq.num_new_tokens = num_new_tokens
             seq.status = SequenceStatus.RUNNING
+            seq.blocked_reason = None
             scheduled_prefill.append(seq)
 
             token_budget -= num_new_tokens
@@ -116,10 +150,13 @@ class Scheduler:
 
             if not seq.block_table:
                 if not self.block_manager.can_allocate(seq):
+                    blocked_prefill += 1
+                    seq.blocked_reason = "no_free_block_for_prefill"
                     break
                 self.block_manager.allocate(seq)
 
-            remaining = len(seq) - seq.num_cached_tokens
+            # 【本次在线化改动】waiting 队列里的新 prefill 也只看 prompt 长度。
+            remaining = seq.num_prompt_tokens - seq.num_cached_tokens
             num_new_tokens = remaining
 
             if self.config.enable_chunked_prefill:
@@ -132,6 +169,7 @@ class Scheduler:
 
             seq.num_new_tokens = num_new_tokens
             seq.status = SequenceStatus.RUNNING
+            seq.blocked_reason = None
 
             self.waiting.popleft()
             self.running.append(seq)
@@ -139,9 +177,37 @@ class Scheduler:
 
             token_budget -= num_new_tokens
             num_seqs += 1
-
-        return scheduled_decode + scheduled_prefill + scheduled_new
         
+        scheduled = scheduled_decode + scheduled_prefill + scheduled_new
+        
+        reason = "ok"
+        if not scheduled:
+            if blocked_decode or blocked_prefill:
+                reason = "blocked_by_blocks"
+            elif token_budget <= 0:
+                reason = "token_budget_exhausted"
+            elif num_seqs >= self.max_num_seqs:
+                reason = "seq_budget_exhausted"
+            elif self.waiting or self.running:
+                reason = "no_runnable_seq"
+            else:
+                reason = "idle"
+
+        self.last_schedule_info = ScheduleOutput(
+            seqs=scheduled,
+            decode_seqs=scheduled_decode,
+            prefill_seqs=scheduled_prefill,
+            new_prefill_seqs=scheduled_new,
+            num_decode_tokens=sum(seq.num_new_tokens for seq in scheduled_decode),
+            num_prefill_tokens=sum(seq.num_new_tokens for seq in scheduled_prefill + scheduled_new),
+            token_budget_used=initial_token_budget - token_budget,
+            token_budget_remaining=token_budget,
+            blocked_decode=blocked_decode,
+            blocked_prefill=blocked_prefill,
+            reason=reason,
+        )
+        return scheduled
+
     def preempty(self, seq):
         """
         调度失败，重新放回wait队列
@@ -194,6 +260,8 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         seq.status = SequenceStatus.FINISHED
         seq.num_new_tokens = 0
+        # 【本次在线化改动】取消时清理调度可观测字段
+        seq.blocked_reason = None
     
     def abort_by_seq_idx(self, seq_idx: int) -> bool:
         for seq in list(self.waiting):
@@ -207,9 +275,6 @@ class Scheduler:
                 return True
 
         return False
-
-
-
 
 
 

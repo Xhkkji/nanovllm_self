@@ -1,0 +1,20 @@
+# Python cache / bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local logs
+logs/
+*.log
+
+# Local benchmark datasets and generated data
+data/
+
+# PD benchmark / worker outputs
+pd_self/multiprocess/result/
+
+# Temporary runtime files
+*.tmp
+*.done
+*.error.json
+*.ready.json

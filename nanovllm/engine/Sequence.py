@@ -14,6 +14,7 @@ class Sequence:
     """
     def __init__(self, seq_idx: int, token_ids: list[int], sampling_params = SamplingParams(), block_size=16):
         self.seq_idx = seq_idx  # 序列id，整个token的ids
+        # 【本次在线化改动】request_id 开始作为服务层请求标识使用，和 seq_idx 解耦
         self.request_id = None
         self.token_ids = token_ids
         self.token_len = len(token_ids)
@@ -29,6 +30,9 @@ class Sequence:
         
         self.finished = False  # 是否完成
         self.status = SequenceStatus.WAITING
+        # 【本次在线化改动】在线调度时记录“为什么这条 seq 暂时没有被调度”
+        # 这个字段只做可观测性，不影响现有离线逻辑。
+        self.blocked_reason = None
         
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens  # 当前seq最多生成多少个token

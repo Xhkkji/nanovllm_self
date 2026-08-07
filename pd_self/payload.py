@@ -3,6 +3,28 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 import torch
 
+
+@dataclass
+class SyncGpuKVRef:
+    """
+    同步 GPU P2P / NCCL KV 传输的轻量引用。
+
+    注意：
+    - 这里不保存真实 tensor。
+    - 真实 KV tensor 在 producer backend 的 pending 表里。
+    - decode 侧根据 shape/dtype 分配接收 buffer，然后 dist.recv。
+    """
+    handoff_id: str
+    shape: tuple[int, ...]
+    dtype: str
+    nbytes: int
+    src_rank: int
+    dst_rank: int
+
+    scale_shape: tuple[int, ...] | None = None
+    scale_dtype: str | None = None
+    scale_nbytes: int = 0
+
 @dataclass
 class SharedMemoryKVRef:
     """
@@ -34,7 +56,13 @@ class KVTransferMeta:
 
     # shared memory / external backend 的跨进程引用
     storage_ref: Optional["SharedMemoryKVRef"] = None
-
+    
+    # 量化
+    # int8_mock 时 scale blocks 的 shared memory 引用
+    scale_storage_ref: Optional["SharedMemoryKVRef"] = None
+    # 方便 decode 侧知道这次 handoff 是否带 scale
+    kv_cache_quant_mode: str = "none"
+    
 @dataclass
 class HandoffPayload:
     """
