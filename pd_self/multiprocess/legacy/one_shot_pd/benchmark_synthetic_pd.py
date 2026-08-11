@@ -7,11 +7,15 @@ import time
 from pathlib import Path
 from time import perf_counter
 
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(CURRENT_DIR)))
-for path in (CURRENT_DIR, ROOT_DIR):
-    if path not in sys.path:
-        sys.path.insert(0, path)
+# Legacy one-shot PD benchmark。
+# 该文件已经被当前主线 benchmark_synthetic_pd_pipeline.py 替代，仅保留为早期实验归档。
+CURRENT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = Path(__file__).resolve().parents[4]
+EVAL_DIR = ROOT_DIR / "pd_self" / "multiprocess" / "evaluation"
+for path in (CURRENT_DIR, EVAL_DIR, ROOT_DIR):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
 os.chdir(ROOT_DIR)
 
 from benchmark_synthetic_common import (
@@ -26,6 +30,7 @@ from benchmark_synthetic_common import (
 
 
 def parse_args():
+    """解析旧版双 GPU PD benchmark 参数；该模式每条请求都会启动短生命周期 worker。"""
     parser = argparse.ArgumentParser(description="Dual-GPU PD synthetic serving benchmark.")
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
     parser.add_argument("--limit", type=int, default=5)
@@ -44,6 +49,7 @@ def parse_args():
 
 
 def wait_for_payload(path, proc, timeout_s, log_path):
+    """等待 prefill worker 写出 payload.pkl；若 prefill 提前退出则带日志路径报错。"""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         if Path(path).exists():
@@ -57,11 +63,13 @@ def wait_for_payload(path, proc, timeout_s, log_path):
 
 
 def read_json(path):
+    """读取 prefill/decode worker 生成的 metrics JSON。"""
     with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
 def run_one(args, row, idx, work_dir):
+    """执行单条旧版 PD 请求：启动 prefill 进程、等待 payload、启动 decode 进程并汇总指标。"""
     request_id = row.get("id", f"synth-{idx:04d}")
     max_tokens = max(2, cap_max_tokens(row, args.max_output_tokens_cap))
     request = {
@@ -90,7 +98,7 @@ def run_one(args, row, idx, work_dir):
 
     prefill_cmd = [
         args.python_bin,
-        "pd_self/multiprocess/prefill_worker.py",
+        "pd_self/multiprocess/legacy/one_shot_pd/prefill_worker.py",
         "--request-json",
         str(request_json),
         "--kv-cache-quant-mode",
@@ -104,7 +112,7 @@ def run_one(args, row, idx, work_dir):
     ]
     decode_cmd = [
         args.python_bin,
-        "pd_self/multiprocess/decode_worker.py",
+        "pd_self/multiprocess/legacy/one_shot_pd/decode_worker.py",
         "--kv-cache-quant-mode",
         args.kv_cache_quant_mode,
         "--infile",
@@ -198,6 +206,7 @@ def run_one(args, row, idx, work_dir):
 
 
 def main():
+    """旧版 PD benchmark 主入口：逐条请求运行短 worker 并写 metrics/summary。"""
     args = parse_args()
     requests = select_requests(
         args.dataset,

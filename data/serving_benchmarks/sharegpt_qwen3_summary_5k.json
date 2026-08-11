@@ -1,0 +1,119 @@
+{
+  "num_requests": 5000,
+  "profiles": {
+    "long_in_long_out": {
+      "count": 72,
+      "input_tokens": {
+        "min": 1047,
+        "p50": 1234,
+        "p90": 1686,
+        "max": 1786
+      },
+      "output_tokens": {
+        "min": 256,
+        "p50": 256,
+        "p90": 256,
+        "max": 256
+      },
+      "total_tokens": {
+        "min": 1303,
+        "p50": 1490,
+        "p90": 1942,
+        "max": 2042
+      }
+    },
+    "long_in_short_out": {
+      "count": 49,
+      "input_tokens": {
+        "min": 1024,
+        "p50": 1283,
+        "p90": 1783,
+        "max": 1921
+      },
+      "output_tokens": {
+        "min": 1,
+        "p50": 35,
+        "p90": 119,
+        "max": 128
+      },
+      "total_tokens": {
+        "min": 1033,
+        "p50": 1332,
+        "p90": 1809,
+        "max": 2046
+      }
+    },
+    "mixed_chat": {
+      "count": 1581,
+      "input_tokens": {
+        "min": 1,
+        "p50": 46,
+        "p90": 740,
+        "max": 1856
+      },
+      "output_tokens": {
+        "min": 1,
+        "p50": 202,
+        "p90": 256,
+        "max": 256
+      },
+      "total_tokens": {
+        "min": 133,
+        "p50": 263,
+        "p90": 907,
+        "max": 1987
+      }
+    },
+    "short_in_long_out": {
+      "count": 2369,
+      "input_tokens": {
+        "min": 1,
+        "p50": 23,
+        "p90": 99,
+        "max": 256
+      },
+      "output_tokens": {
+        "min": 256,
+        "p50": 256,
+        "p90": 256,
+        "max": 256
+      },
+      "total_tokens": {
+        "min": 257,
+        "p50": 279,
+        "p90": 355,
+        "max": 512
+      }
+    },
+    "short_in_short_out": {
+      "count": 929,
+      "input_tokens": {
+        "min": 1,
+        "p50": 16,
+        "p90": 98,
+        "max": 256
+      },
+      "output_tokens": {
+        "min": 1,
+        "p50": 59,
+        "p90": 115,
+        "max": 128
+      },
+      "total_tokens": {
+        "min": 2,
+        "p50": 92,
+        "p90": 168,
+        "max": 380
+      }
+    }
+  },
+  "input": "data/serving_benchmarks/ShareGPT_V3_unfiltered_cleaned_split.json",
+  "output": "data/serving_benchmarks/sharegpt_qwen3_tokenized_5k.jsonl",
+  "model_path": "/home/xhk/model/Qwen3-0.6B/",
+  "skipped": {
+    "too_long": 105,
+    "no_user_assistant_turn": 122
+  },
+  "max_total_tokens": 2048,
+  "max_output_tokens_cap": 256
+}

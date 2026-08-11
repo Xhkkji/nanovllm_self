@@ -42,18 +42,29 @@ from pd_self.prefill_engine import PrefillEngine
 
 
 def sync_cuda():
+    """同步当前 CUDA 设备，保证 prefill/send 相关耗时统计包含实际 GPU 执行时间。"""
     # 所有计时点前后都显式 synchronize，避免 CUDA 异步执行导致时间偏小。
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
 
+def destroy_process_group(args) -> None:
+    """销毁 NCCL process group。"""
+    if not torch.distributed.is_initialized():
+        return
+    torch.distributed.destroy_process_group()
+
+
 def build_config(args):
+    """构造常驻 prefill worker 的 nano-vLLM 配置，并与 decode worker 保持 KV 形状一致。"""
     # benchmark 先固定一个较小但足够覆盖 synthetic smoke 的配置。
-    # 注意这里 device 永远写 cuda:0，因为每个 worker 进程通过
-    # CUDA_VISIBLE_DEVICES 只暴露自己负责的那张物理卡。
+    # 单 pair 模式下 local_cuda_device 默认是 0；
+    # pool 模式下 driver 会让所有 worker 看见同一份 pool GPU 列表，
+    # 再用 --local-cuda-device 指定当前 worker 真正使用哪张本地可见卡。
+    device = f"cuda:{args.local_cuda_device}"
     return Config(
         model_path=args.model_path,
-        device="cuda:0",
+        device=device,
         max_num_seqs=4,
         max_num_batched_tokens=512,
         max_model_len=512,
@@ -66,6 +77,7 @@ def build_config(args):
 
 
 def atomic_write_json(path: Path, obj) -> None:
+    """原子写 JSON 文件，防止 decode/driver 读到半写入状态。"""
     # 先写 .tmp 再 replace，避免 decode/driver 读到半写入的 JSON 文件。
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     with tmp_path.open("w", encoding="utf-8") as f:
@@ -73,7 +85,39 @@ def atomic_write_json(path: Path, obj) -> None:
     tmp_path.replace(path)
 
 
+def write_worker_state(
+    args,
+    work_dir: Path,
+    seq_idx: int,
+    pending_handoffs: dict[str, str],
+    pending_sends: dict,
+    request_queue_depth: int = 0,
+    busy: bool = False,
+    current_request_base: str | None = None,
+) -> None:
+    """写出 prefill worker 当前状态，供多 PD pair driver 做真实 worker feedback 调度。"""
+    # Agent-aware / Runtime feedback：
+    # 这个文件是调度器看到的“真实 worker 侧状态”。它不参与 worker 内部逻辑，
+    # 只给外层 driver 读取，用于判断某个 pair 是否已经有 prefill 队列或异步 send 积压。
+    atomic_write_json(
+        work_dir / args.state_file,
+        {
+            "role": "persistent_prefill",
+            "updated_time_s": time.time(),
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "processed_requests": seq_idx,
+            "busy": busy,
+            "current_request_base": current_request_base,
+            "request_queue_depth": request_queue_depth,
+            "pending_handoffs": len(pending_handoffs),
+            "pending_sends": len(pending_sends),
+            "max_pending_sends": args.max_pending_sends,
+        },
+    )
+
+
 def atomic_write_pickle(path: Path, obj) -> None:
+    """原子写 pickle payload，防止 decode 侧读取到不完整的 HandoffPayload。"""
     # payload.pkl 同样需要原子写。否则 decode 侧可能在 pickle 尚未写完时读取。
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     with tmp_path.open("wb") as f:
@@ -82,6 +126,7 @@ def atomic_write_pickle(path: Path, obj) -> None:
 
 
 def request_base(request_path: Path) -> str:
+    """从 request.json 文件名里提取请求 base，用于拼接 payload/metrics/done 文件名。"""
     # 文件协议约定：
     #   0000_synth-0000.request.json
     # 的 base 是：
@@ -129,6 +174,50 @@ def build_paths(work_dir: Path, base: str):
         "prefill_error": work_dir / f"{base}.prefill_error.json",
         "decode_done": work_dir / f"{base}.decode_done",
     }
+
+def build_handoff_paths_for_request(args, request_path: Path, base: str):
+    """
+    ########################### NCCL 池化 PD 路径解析 ###########################
+    prefill worker 扫描的是自己的 request.json。
+
+    但是 pool 模式下，payload / recv_ready / prefill_done / decode_done
+    都写在目标 decode worker 的 work_dir 里。
+
+    所以 prefill 主循环判断“这个 request 是否已经完成”时，
+    不能只看自己的 prefill work_dir，而要根据 request["pd_pool"]["decode_work_dir"]
+    找到真正的 handoff 目录。
+    """
+    with request_path.open(encoding="utf-8") as f:
+        request = json.load(f)
+
+    if is_sync_gpu_backend(args) and getattr(args, "pool_mode", False):
+        handoff_work_dir = Path(request["pd_pool"]["decode_work_dir"])
+    else:
+        handoff_work_dir = Path(args.work_dir)
+
+    return build_paths(handoff_work_dir, base)
+
+
+def count_pending_request_files(args, work_dir: Path, pending_sends: dict) -> int:
+    """统计 prefill worker 当前还需要处理的 request 文件数量。"""
+    pending = 0
+    for request_path in work_dir.glob("*.request.json"):
+        base = request_base(request_path)
+        
+        # ########################### NCCL 池化 PD ###########################
+        # pool 模式下，完成标记不在 prefill work_dir，而在目标 decode work_dir。
+        # 所以这里必须根据 request["pd_pool"]["decode_work_dir"] 找真实 handoff paths。
+        paths = build_handoff_paths_for_request(args, request_path, base)
+
+        if (
+            base in pending_sends
+            or paths["prefill_done"].exists()
+            or paths["decode_done"].exists()
+            or paths["prefill_error"].exists()
+        ):
+            continue
+        pending += 1
+    return pending
     
 def is_sync_gpu_backend(args) -> bool:
     """
@@ -220,10 +309,37 @@ def process_request(args, engine, backend, request_path: Path, seq_idx: int, con
     """
     work_dir = Path(args.work_dir)
     base = request_base(request_path)
-    paths = build_paths(work_dir, base)
 
     with request_path.open(encoding="utf-8") as f:
         request = json.load(f)
+
+    # ########################### NCCL 池化 PD 路由信息 ###########################
+    # 池化模式下，request.json 由 coordinator 写入 pd_pool 字段。
+    # 这个字段告诉 prefill worker：
+    #   1. 本条请求的 KV 要发给哪个 decode worker
+    #   2. 目标 decode worker 的 NCCL rank 是多少
+    #   3. payload / recv_ready / prefill_done / decode_done 应该写到哪个 decode work_dir
+    #
+    # 为什么要放在 run_prefill 前：
+    #   run_prefill() 内部会触发 KVConnector.save_kv()
+    #   save_kv() 又会调用 SyncGpuKVStoreBackend.put()
+    #   put() 会把 dst_rank 写进 SyncGpuKVRef。
+    # 所以 dst_rank 必须在 run_prefill 前设置好。
+    route = request.get("pd_pool", {})
+    
+    if is_sync_gpu_backend(args) and getattr(args, "pool_mode", False):
+        dst_rank = int(route["dst_rank"])
+        backend.set_peer_rank(dst_rank)
+
+        # 池化模式下，decode worker 只扫描自己的 work_dir。
+        # 因此 payload_ready / recv_ready / prefill_done / decode_done
+        # 都要落到目标 decode worker 的目录，而不是当前 prefill worker 的目录。
+        handoff_work_dir = Path(route["decode_work_dir"])
+    else:
+        handoff_work_dir = work_dir
+
+    paths = build_paths(handoff_work_dir, base)
+    # ########################### NCCL 池化 PD 路由信息 ###########################
 
     prompt = request["prompt"]
     request_id = request.get("id", base)
@@ -295,18 +411,28 @@ def process_request(args, engine, backend, request_path: Path, seq_idx: int, con
                     f"sync_gpu request {request_id} has no transfer_meta"
                 )
             
-            if control is None:
-                raise RuntimeError("sync_gpu requires control connection")
+            if getattr(args, "pool_mode", False):
+                # ########################### NCCL 池化 PD 文件握手 ###########################
+                # pool 模式下，一个 decode worker 可能接收多个 prefill worker 的请求。
+                # 为了避免给每个 P-D 组合维护一条 control socket，第一版直接用文件做控制面：
+                #   1. prefill 把 payload.pkl 写到目标 decode work_dir；
+                #   2. prefill 写 payload_ready，表示 metadata 可读；
+                #   3. decode 扫到 payload_ready 后读 metadata，并写 recv_ready；
+                #   4. prefill 看到 recv_ready 后提交 NCCL isend。
+                paths["payload_ready"].write_text("ready\n", encoding="utf-8")
+            else:
+                if control is None:
+                    raise RuntimeError("sync_gpu requires control connection")
 
-            # 通知 decode：payload.pkl 已经写好，可以读取 metadata。
-            control.send(
-                {
-                    "type": "payload_ready",
-                    "base": base,
-                    "request_id": request_id,
-                    "handoff_id": handoff_id,
-                }
-            )
+                # 单 pair sync_gpu 继续使用原来的 socket 控制面，保证旧链路不受 pool 改动影响。
+                control.send(
+                    {
+                        "type": "payload_ready",
+                        "base": base,
+                        "request_id": request_id,
+                        "handoff_id": handoff_id,
+                    }
+                )
             
             # 写 payload.pkl
             # -> control.send(payload_ready)
@@ -324,8 +450,16 @@ def process_request(args, engine, backend, request_path: Path, seq_idx: int, con
                 if perf_counter() - wait_t0 > args.decode_wait_timeout_s:
                     raise TimeoutError(f"timed out waiting recv_ready for {request_id}")
 
-                # 轮询非阻塞地检查 control 连接上是否有新消息
-                # 有新消息是指decode端已经准备好传输
+                if getattr(args, "pool_mode", False):
+                    # ########################### NCCL 池化 PD 文件握手 ###########################
+                    # pool 模式下 decode 通过 recv_ready 文件告诉 prefill：
+                    # 它已经读到 payload metadata，可以接收来自 src_rank 的 KV。
+                    if paths["recv_ready"].exists():
+                        break
+                    time.sleep(args.poll_interval_s)
+                    continue
+
+                # 单 pair sync_gpu：轮询 socket，等待 decode 的 recv_ready 消息。
                 if not control.poll(args.poll_interval_s):
                     continue
 
@@ -466,14 +600,20 @@ def process_request(args, engine, backend, request_path: Path, seq_idx: int, con
     return base, handoff_id, None
 
 
-def cleanup_completed_handoffs(work_dir: Path, backend, pending_handoffs: dict[str, str]) -> None:
+def cleanup_completed_handoffs(args, work_dir: Path, backend, pending_handoffs: dict[str, str]) -> None:
+    """pipeline 模式下回收已经 decode 完成的 handoff 元数据，避免 producer 侧状态堆积。"""
     # Pipeline 模式使用：
     # prefill 不阻塞等待 decode_done，因此 producer backend._records 会暂时保存
     # handoff_id -> SharedMemoryKVRef metadata。
     # 一旦发现某个 base 的 decode_done，说明 decode 已经 restore 并 unlink 了 shared memory，
     # 这里就可以清理 producer 侧 metadata。这个操作不影响 decode 已经拿到的 KV。
     for base, handoff_id in list(pending_handoffs.items()):
-        paths = build_paths(work_dir, base)
+        request_path = work_dir / f"{base}.request.json"
+        # ########################### NCCL 池化 PD 收尾 ###########################
+        # pool 模式下 decode_done 写在目标 decode work_dir，而不是 prefill work_dir。
+        # 如果这里仍然 build_paths(work_dir, base)，producer 侧 pending_handoffs
+        # 会一直清不掉，资源检查会显示 pending_handoffs > 0。
+        paths = build_handoff_paths_for_request(args, request_path, base)
         if not paths["decode_done"].exists():
             continue
         backend.delete(handoff_id)
@@ -481,6 +621,7 @@ def cleanup_completed_handoffs(work_dir: Path, backend, pending_handoffs: dict[s
 
 
 def parse_args():
+    """解析常驻 prefill worker 参数，包括 work_dir、传输后端、控制面和异步发送上限。"""
     parser = argparse.ArgumentParser(description="Persistent prefill worker for local PD benchmark.")
     parser.add_argument("--model-path", default="/home/xhk/model/Qwen3-0.6B/")
     parser.add_argument("--work-dir", required=True)
@@ -508,30 +649,56 @@ def parse_args():
         help="Max in-flight async PD producer sends before applying backpressure.",
     )
     parser.add_argument("--nccl-port", default="29577")
+    parser.add_argument("--state-file", default="prefill_worker_state.json")
+    
+    # 增加全局 NCCL rank 参数：
+    parser.add_argument("--global-rank", type=int, default=0)
+    parser.add_argument("--world-size", type=int, default=2)
+    parser.add_argument("--pool-mode", action="store_true")
+    parser.add_argument("--prefill-worker-id", type=int, default=0)
+    parser.add_argument("--local-cuda-device", type=int, default=0)
+    
     return parser.parse_args()
 
 
 def main():
+    """常驻 prefill worker 主入口：初始化模型/传输后端，循环消费请求并处理 KV handoff。"""
     args = parse_args()
     work_dir = Path(args.work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     
     if args.kv_transfer_backend == "sync_gpu":
-        torch.cuda.set_device(0)
+        torch.cuda.set_device(args.local_cuda_device)
+        
+        # ########################### NCCL 池化 PD 初始化 ###########################
+        # 所有 P/D worker 加入同一个 global process group。
+        # 例如 2P2D：
+        #   rank 0: P0
+        #   rank 1: P1
+        #   rank 2: D0
+        #   rank 3: D1
+        #
+        # prefill worker 不再固定 peer_rank，目标 decode rank 会在每条 request 里指定。
+        
         # 这里初始化 distributed
         torch.distributed.init_process_group(
             backend="nccl",
             init_method=f"tcp://127.0.0.1:{args.nccl_port}",
-            rank=0,
-            world_size=2,
+            rank=args.global_rank,
+            world_size=args.world_size,
+            # ########################### NCCL 池化 PD 本地设备绑定 ###########################
+            # ########################### NCCL 池化 PD 本地设备绑定 ###########################
+            # pool 模式下 global_rank 表示通信身份，local_cuda_device 表示本进程用的本地 GPU。
+            # 这两个概念必须拆开；否则 rank 2/3 很容易被误当成本地 cuda:2/cuda:3。
+            device_id=torch.device(f"cuda:{args.local_cuda_device}"),
         )
-        backend = SyncGpuKVStoreBackend(rank=0, peer_rank=1)  # prefill
+        backend = SyncGpuKVStoreBackend(rank=args.global_rank, peer_rank=None)  # prefill
     else:
         backend = SharedMemoryKVStoreBackend()
 
     print("cuda_visible_devices", os.environ.get("CUDA_VISIBLE_DEVICES"), flush=True)
     print("torch_current_device", torch.cuda.current_device(), flush=True)
-    print("torch_device_name", torch.cuda.get_device_name(0), flush=True)
+    print("torch_device_name", torch.cuda.get_device_name(args.local_cuda_device), flush=True)
 
 
     init_t0 = perf_counter()
@@ -558,7 +725,7 @@ def main():
     init_time_s = perf_counter() - init_t0
     
     control = None
-    if args.kv_transfer_backend == "sync_gpu":
+    if args.kv_transfer_backend == "sync_gpu" and not args.pool_mode:
         control = connect_control(
         control_socket_path(work_dir),
         timeout_s=args.decode_wait_timeout_s,
@@ -572,7 +739,7 @@ def main():
             "role": "persistent_prefill",
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
             "torch_current_device": int(torch.cuda.current_device()),
-            "torch_device_name": torch.cuda.get_device_name(0),
+            "torch_device_name": torch.cuda.get_device_name(args.local_cuda_device),
             "kv_cache_quant_mode": args.kv_cache_quant_mode,
             "kv_transfer_backend": args.kv_transfer_backend,
             "control_connected": control is not None,
@@ -595,6 +762,7 @@ def main():
     # send 完成后才写 prefill_metrics 和 prefill_done。
     pending_sends = {}
     # ########################### 异步 PD producer pending_sends ###########################
+    write_worker_state(args, work_dir, seq_idx, pending_handoffs, pending_sends)
     try:
         # 主循环：只要没有 shutdown 文件，就持续扫描新请求。
         # 串行 benchmark 下，每条请求会等 decode_done。
@@ -607,8 +775,16 @@ def main():
                 pending_sends,
                 block=False,
             )
-            cleanup_completed_handoffs(work_dir, backend, pending_handoffs)
+            cleanup_completed_handoffs(args, work_dir, backend, pending_handoffs)
             request_paths = sorted(work_dir.glob("*.request.json"))
+            write_worker_state(
+                args,
+                work_dir,
+                seq_idx,
+                pending_handoffs,
+                pending_sends,
+                request_queue_depth=count_pending_request_files(args, work_dir, pending_sends),
+            )
             for request_path in request_paths:
                 # ########################### 异步 PD producer pending_sends ###########################
                 # request_paths 可能一次性包含很多请求。
@@ -635,16 +811,34 @@ def main():
                     # ########################### 异步 PD producer backpressure ###########################
 
                 base = request_base(request_path)
-                paths = build_paths(work_dir, base)
+                # ########################### NCCL 池化 PD ###########################
+                # 这里不能直接 build_paths(work_dir, base)。
+                # pool 模式下，prefill 目录里只有 request.json；
+                # payload / recv_ready / prefill_done / decode_done 都在目标 decode work_dir。
+                # 如果还查 prefill work_dir，prefill 会看不到已经完成的旧请求，
+                # 然后重复处理旧 request，导致 NCCL send/recv 顺序错乱。
+                paths = build_handoff_paths_for_request(args, request_path, base)
+
                 # 已完成或已失败的请求不重复处理。
                 if (
                     base in pending_sends
                     or paths["prefill_done"].exists()
+                    or paths["decode_done"].exists()
                     or paths["prefill_error"].exists()
                 ):
                     continue
                 made_progress = True
                 try:
+                    write_worker_state(
+                        args,
+                        work_dir,
+                        seq_idx,
+                        pending_handoffs,
+                        pending_sends,
+                        request_queue_depth=count_pending_request_files(args, work_dir, pending_sends),
+                        busy=True,
+                        current_request_base=base,
+                    )
                     base, handoff_id, pending_send = process_request(
                         args,
                         engine,
@@ -663,6 +857,14 @@ def main():
                     if not args.wait_decode_done and handoff_id is not None:
                         pending_handoffs[base] = handoff_id
                     seq_idx += 1
+                    write_worker_state(
+                        args,
+                        work_dir,
+                        seq_idx,
+                        pending_handoffs,
+                        pending_sends,
+                        request_queue_depth=count_pending_request_files(args, work_dir, pending_sends),
+                    )
 
                     # ########################### 异步 PD producer pending_sends ###########################
                     # 当前请求可能刚提交了 isend；立刻轮询一次。
@@ -695,11 +897,12 @@ def main():
                 pending_sends,
                 block=True,
             )
-        cleanup_completed_handoffs(work_dir, backend, pending_handoffs)
+        cleanup_completed_handoffs(args, work_dir, backend, pending_handoffs)
+        write_worker_state(args, work_dir, seq_idx, pending_handoffs, pending_sends)
         if control is not None:
             control.close()
-        if args.kv_transfer_backend == "sync_gpu" and torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
+        if args.kv_transfer_backend == "sync_gpu":
+            destroy_process_group(args)
         print("persistent_prefill_shutdown", flush=True)
 
 

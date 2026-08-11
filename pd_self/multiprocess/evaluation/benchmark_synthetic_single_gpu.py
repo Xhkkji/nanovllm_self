@@ -27,17 +27,20 @@ from nanovllm.sampling_params import SamplingParams
 
 
 def sync_cuda():
+    """同步当前 CUDA 设备，保证单卡 benchmark 的 e2e 计时包含真实 GPU 执行时间。"""
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
 
 def peak_memory_mb():
+    """返回当前进程本轮生成的 CUDA 峰值显存，CPU 环境下返回 0。"""
     if not torch.cuda.is_available():
         return 0.0
     return torch.cuda.max_memory_allocated() / 1024 / 1024
 
 
 def ensure_attention_backend_labels(llm):
+    """给 attention 层补齐 profile 需要的 backend 标签，兼容没有显式标注的实现。"""
     for layer in llm.model_runner.model.layers:
         attn = layer.p_attn
         if not hasattr(attn, "prefill_backend"):
@@ -47,6 +50,7 @@ def ensure_attention_backend_labels(llm):
 
 
 def parse_args():
+    """解析单卡 baseline benchmark 参数，包括数据集、warmup、profile 和输出路径。"""
     parser = argparse.ArgumentParser(description="Single-GPU synthetic serving benchmark.")
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
     parser.add_argument("--limit", type=int, default=5)
@@ -60,6 +64,7 @@ def parse_args():
 
 
 def main():
+    """单卡 benchmark 主入口：逐条请求调用 LLM_self.generate，并写出 baseline 指标。"""
     args = parse_args()
     args.output = args.output or default_metrics_path("single_gpu", args.profile)
     args.summary_output = args.summary_output or default_summary_path("single_gpu", args.profile)

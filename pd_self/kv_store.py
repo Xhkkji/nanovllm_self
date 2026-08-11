@@ -124,6 +124,7 @@ class KVStoreBackend(ABC):
     @abstractmethod
     def exists(self, handoff_id: str) -> bool:
         raise NotImplementedError
+    
 
 class DictKVStoreBackend(KVStoreBackend):
     """
@@ -398,10 +399,21 @@ class SyncGpuKVStoreBackend(KVStoreBackend):
     """
     device_direct = True
 
-    def __init__(self, rank: int, peer_rank: int):
+    def __init__(self, rank: int, peer_rank: int | None = None):
         self.rank = rank
         self.peer_rank = peer_rank
         self._pending: dict[str, PendingGpuKVItem] = {}
+
+    def set_peer_rank(self, peer_rank: int) -> None:
+        """
+        ########################### NCCL 池化 PD ###########################
+        设置“本条请求”的目标 decode rank。
+
+        单 pair 时代 peer_rank 固定；池化时代同一个 prefill worker
+        可能连续把不同请求发给不同 decode worker，所以 prefill 在 run_prefill()
+        前根据 request["pd_pool"]["dst_rank"] 动态设置。
+        """
+        self.peer_rank = peer_rank
 
     def _dtype_to_torch(self, dtype: str):
         if dtype == "torch.bfloat16":
@@ -426,12 +438,13 @@ class SyncGpuKVStoreBackend(KVStoreBackend):
         - tensor 必须挂在 AsyncSendState 里，直到所有 work 完成。
         """
         item = self._pending.pop(handoff_id)
+        dst_rank = item.storage_ref.dst_rank
 
         works = [
-            torch.distributed.isend(item.kv_blocks, dst=self.peer_rank)
+            torch.distributed.isend(item.kv_blocks, dst=dst_rank)
         ]
         if item.scale_blocks is not None:
-            works.append(torch.distributed.isend(item.scale_blocks, dst=self.peer_rank))
+            works.append(torch.distributed.isend(item.scale_blocks, dst=dst_rank))
 
         return AsyncSendState(
             handoff_id=handoff_id,
@@ -523,6 +536,8 @@ class SyncGpuKVStoreBackend(KVStoreBackend):
         """
         if item.kv_blocks is None:
             raise ValueError("SyncGpuKVStoreBackend.put requires kv_blocks")
+        if self.peer_rank is None:
+            raise RuntimeError("sync_gpu requires peer_rank before put()")
 
         kv_blocks = item.kv_blocks.detach().contiguous()
         scale_blocks = (
@@ -568,10 +583,11 @@ class SyncGpuKVStoreBackend(KVStoreBackend):
         - send 不完成，prefill worker 不继续释放这份 pending KV。
         """
         item = self._pending.pop(handoff_id)
+        dst_rank = item.storage_ref.dst_rank
 
-        torch.distributed.send(item.kv_blocks, dst=self.peer_rank)
+        torch.distributed.send(item.kv_blocks, dst=dst_rank)
         if item.scale_blocks is not None:
-            torch.distributed.send(item.scale_blocks, dst=self.peer_rank)
+            torch.distributed.send(item.scale_blocks, dst=dst_rank)
 
     def pop_by_ref(
         self,

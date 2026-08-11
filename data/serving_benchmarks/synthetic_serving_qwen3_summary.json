@@ -1,0 +1,123 @@
+{
+  "num_requests": 200,
+  "profiles": {
+    "long_in_long_out": {
+      "count": 40,
+      "input_tokens": {
+        "min": 986,
+        "p50": 1470,
+        "p90": 1776,
+        "max": 2013
+      },
+      "output_tokens": {
+        "min": 101,
+        "p50": 128,
+        "p90": 147,
+        "max": 168
+      },
+      "total_tokens": {
+        "min": 1129,
+        "p50": 1603,
+        "p90": 1890,
+        "max": 2136
+      },
+      "fits_512": 0,
+      "fits_2048": 39
+    },
+    "long_in_short_out": {
+      "count": 40,
+      "input_tokens": {
+        "min": 712,
+        "p50": 1560,
+        "p90": 1776,
+        "max": 1890
+      },
+      "output_tokens": {
+        "min": 12,
+        "p50": 16,
+        "p90": 17,
+        "max": 20
+      },
+      "total_tokens": {
+        "min": 728,
+        "p50": 1577,
+        "p90": 1790,
+        "max": 1905
+      },
+      "fits_512": 0,
+      "fits_2048": 40
+    },
+    "mixed_chat": {
+      "count": 40,
+      "input_tokens": {
+        "min": 32,
+        "p50": 396,
+        "p90": 2280,
+        "max": 2313
+      },
+      "output_tokens": {
+        "min": 16,
+        "p50": 64,
+        "p90": 128,
+        "max": 128
+      },
+      "total_tokens": {
+        "min": 62,
+        "p50": 460,
+        "p90": 2347,
+        "max": 2441
+      },
+      "fits_512": 21,
+      "fits_2048": 34
+    },
+    "short_in_long_out": {
+      "count": 40,
+      "input_tokens": {
+        "min": 50,
+        "p50": 90,
+        "p90": 108,
+        "max": 120
+      },
+      "output_tokens": {
+        "min": 87,
+        "p50": 131,
+        "p90": 152,
+        "max": 162
+      },
+      "total_tokens": {
+        "min": 174,
+        "p50": 217,
+        "p90": 259,
+        "max": 266
+      },
+      "fits_512": 40,
+      "fits_2048": 40
+    },
+    "short_in_short_out": {
+      "count": 40,
+      "input_tokens": {
+        "min": 48,
+        "p50": 93,
+        "p90": 111,
+        "max": 123
+      },
+      "output_tokens": {
+        "min": 9,
+        "p50": 15,
+        "p90": 18,
+        "max": 20
+      },
+      "total_tokens": {
+        "min": 61,
+        "p50": 108,
+        "p90": 121,
+        "max": 139
+      },
+      "fits_512": 40,
+      "fits_2048": 40
+    }
+  },
+  "input": "data/serving_benchmarks/synthetic_serving_lengths.jsonl",
+  "output": "data/serving_benchmarks/synthetic_serving_qwen3_tokenized.jsonl",
+  "model_path": "/home/xhk/model/Qwen3-0.6B/"
+}

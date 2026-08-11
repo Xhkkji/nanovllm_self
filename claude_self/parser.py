@@ -48,11 +48,23 @@ def parse_agent_output(text: str):
             "content": final_content,
         }
 
+    # 小模型有时会输出：
+    # FINAL
+    # answer...
+    # 而不是严格的 FINAL: answer。这里做兼容，避免最终答案里残留协议头。
+    lines = text.splitlines()
+    if lines and lines[0].strip() == "FINAL":
+        final_content = "\n".join(lines[1:]).strip()
+        final_content = clean_final_content(final_content)
+        return {
+            "type": "final",
+            "content": final_content,
+        }
+
     
     # text = "第一行\n第二行\n第三行"
     # lines = text.splitlines()
     # print(lines)  # ['第一行', '第二行', '第三行']
-    lines = text.splitlines()
 
     # ACTION 协议（执行动作）
     # 模型决定调用某个工具/函数：
@@ -98,4 +110,3 @@ def parse_agent_output(text: str):
         "type": "final",
         "content": clean_final_content(text),
     }
-

@@ -40,15 +40,29 @@ from benchmark_synthetic_common import (
     write_json,
     write_jsonl,
 )
+from pd_self.multiprocess.agent_scheduler import (
+    AgentSchedulerConfig,
+    build_agent_request_estimate,
+    init_worker_states,
+    parse_initial_backlogs,
+    schedule_request,
+    worker_summary,
+)
 
 
 def result_mode(args):
+    """根据传输后端和负载模式生成 result 目录前缀。"""
     if getattr(args, "kv_transfer_backend", "shared_memory") == "shared_memory":
-        return "pipeline_pd"
-    return f"pipeline_pd_{args.kv_transfer_backend}"
+        mode = "pipeline_pd"
+    else:
+        mode = f"pipeline_pd_{args.kv_transfer_backend}"
+    if getattr(args, "load_mode", "batch") != "batch":
+        mode = f"{mode}_{args.load_mode}_c{args.concurrency}"
+    return mode
 
 
 def atomic_write_json(path: Path, obj) -> None:
+    """原子写 request/summary JSON，避免 worker 或 driver 读到半写入文件。"""
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     with tmp_path.open("w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
@@ -56,11 +70,13 @@ def atomic_write_json(path: Path, obj) -> None:
 
 
 def read_json(path):
+    """读取 worker ready、prefill metrics 或 decode metrics JSON。"""
     with Path(path).open(encoding="utf-8") as f:
         return json.load(f)
 
 
 def clean_work_dir(work_dir: Path):
+    """清理 pipeline work_dir 中的旧控制文件，避免历史 done/error 干扰本轮 benchmark。"""
     work_dir.mkdir(parents=True, exist_ok=True)
     for path in work_dir.iterdir():
         if path.is_file():
@@ -68,11 +84,13 @@ def clean_work_dir(work_dir: Path):
 
 
 def request_base(idx, request_id):
+    """为一条请求生成稳定且不冲突的文件名前缀。"""
     safe_id = str(request_id).replace("/", "_")
     return f"{idx:04d}_{safe_id}"
 
 
 def build_paths(work_dir: Path, base: str):
+    """根据 base 生成 prefill/decode/driver 共享的文件协议路径。"""
     return {
         "request": work_dir / f"{base}.request.json",
         "prefill_metrics": work_dir / f"{base}.prefill_metrics.json",
@@ -87,6 +105,7 @@ def build_paths(work_dir: Path, base: str):
 
 
 def wait_for_file(path: Path, timeout_s: float):
+    """等待单个文件出现，主要用于 worker ready 文件。"""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         if path.exists():
@@ -96,6 +115,7 @@ def wait_for_file(path: Path, timeout_s: float):
 
 
 def raise_if_worker_error(paths_by_base):
+    """扫描所有已提交请求的 error 文件，发现 worker 异常时立即抛出。"""
     for paths in paths_by_base.values():
         for key in ("prefill_error", "decode_error"):
             error_path = paths[key]
@@ -106,6 +126,7 @@ def raise_if_worker_error(paths_by_base):
 
 
 def wait_for_all_decode_done(paths_by_base, submit_times, timeout_s):
+    """batch 模式等待所有请求完成 decode，并记录每条请求被观察到完成的时间。"""
     deadline = time.time() + timeout_s
     completed_at = {}
     while time.time() < deadline:
@@ -123,6 +144,7 @@ def wait_for_all_decode_done(paths_by_base, submit_times, timeout_s):
 
 
 def start_worker(args, role, work_dir: Path, log_path: Path):
+    """启动 pipeline benchmark 使用的常驻 prefill/decode worker 子进程。"""
     env = os.environ.copy()
     if role == "prefill":
         env["CUDA_VISIBLE_DEVICES"] = args.prefill_gpu
@@ -171,44 +193,187 @@ def start_worker(args, role, work_dir: Path, log_path: Path):
         )
 
 
-def submit_requests(args, entries, work_dir: Path):
+def build_scheduler_runtime(args):
+    """构造可选的 Agent-aware 虚拟调度器运行态；scheduler=none 时返回 None。"""
+    if args.scheduler == "none":
+        return None
+
+    initial_backlogs = parse_initial_backlogs(
+        args.initial_backlog_s,
+        args.num_worker_slots,
+    )
+    return {
+        "config": AgentSchedulerConfig(),
+        "workers": init_worker_states(args.num_worker_slots, initial_backlogs),
+        "initial_backlog_s": initial_backlogs,
+        "session_to_worker": {},
+    }
+
+
+def build_scheduler_metadata(args, scheduler_runtime, row, idx, request_id, max_tokens):
+    """为单条请求生成 Agent-aware 调度元数据，并更新虚拟 worker slot 状态。"""
+    if scheduler_runtime is None:
+        return {}
+
+    config = scheduler_runtime["config"]
+    workers = scheduler_runtime["workers"]
+    estimate = build_agent_request_estimate(row, idx, max_tokens, config)
+
+    # Agent-aware PD benchmark 接入点：
+    # 当前版本先使用“虚拟 worker slot”做调度决策记录，真实请求仍提交给同一组 PD worker。
+    # 这样可以在不引入多进程/多实例复杂度的前提下，把 Agent 复杂度感知调度接入真实
+    # pipeline benchmark，并输出每条请求的 worker slot、复杂度和估计排队时间。
+    schedule_meta = schedule_request(
+        workers,
+        args.scheduler,
+        idx,
+        estimate,
+        arrival_t_s=0.0,
+        config=config,
+        session_to_worker=scheduler_runtime["session_to_worker"],
+    )
+    return {
+        "scheduler": args.scheduler,
+        # Agent trace 字段原样写入 pipeline metrics，保证单 pair 虚拟调度和
+        # multi-pair 真实调度使用同一套结果字段。
+        "program_id": row.get("program_id", estimate.session_id),
+        "session_id": estimate.session_id,
+        "step_id": row.get("step_id"),
+        "num_steps": row.get("num_steps"),
+        "task_kind": row.get("task_kind"),
+        "affinity_hit": schedule_meta["affinity_hit"],
+        "preferred_worker_id": schedule_meta["preferred_worker_id"],
+        "worker_slot_id": schedule_meta["worker_id"],
+        "task_type": estimate.task_type,
+        "estimated_tool_calls": estimate.estimated_tool_calls,
+        "estimated_steps": estimate.estimated_steps,
+        "complexity_score": estimate.complexity_score,
+        "slot_arrival_time_s": schedule_meta["arrival_time_s"],
+        "slot_start_time_s": schedule_meta["start_time_s"],
+        "slot_finish_time_s": schedule_meta["finish_time_s"],
+        "slot_queue_wait_time_s": schedule_meta["queue_wait_time_s"],
+        "estimated_service_time_s": schedule_meta["estimated_service_time_s"],
+        "estimated_slot_e2e_time_s": schedule_meta["estimated_e2e_time_s"],
+    }
+
+
+def submit_request_entry(args, entry, work_dir: Path, scheduler_runtime=None):
+    """向 work_dir 写入一条 request.json，并返回后续汇总 metrics 所需的追踪信息。"""
+    idx, row, phase, measure_index = entry
+    request_id = row.get("id", f"synth-{idx:04d}")
+    base = request_base(idx, request_id)
+    paths = build_paths(work_dir, base)
+    max_tokens = max(2, cap_max_tokens(row, args.max_output_tokens_cap))
+    request = {
+        **row,
+        "id": request_id,
+        "max_tokens": max_tokens,
+    }
+
+    now = perf_counter()
+    metadata = {
+        "phase": phase,
+        "request_index": idx,
+        "measure_index": measure_index,
+        "request_id": request_id,
+        "profile": row.get("profile"),
+        "input_tokens_dataset": row.get("input_tokens"),
+        "max_tokens": max_tokens,
+        "target_output_tokens": row.get("max_tokens", row.get("output_len")),
+        "total_tokens_dataset": row.get("total_tokens"),
+        **build_scheduler_metadata(
+            args,
+            scheduler_runtime,
+            row,
+            idx,
+            request_id,
+            max_tokens,
+        ),
+    }
+    atomic_write_json(paths["request"], request)
+    return base, paths, metadata, now
+
+
+def submit_requests(args, entries, work_dir: Path, scheduler_runtime=None):
+    """一次性提交多条请求，用于 warmup 或 batch pipeline 压测。"""
     paths_by_base = {}
     metadata_by_base = {}
     submit_times = {}
     first_submit_t = None
 
-    for idx, row, phase, measure_index in entries:
-        request_id = row.get("id", f"synth-{idx:04d}")
-        base = request_base(idx, request_id)
-        paths = build_paths(work_dir, base)
-        max_tokens = max(2, cap_max_tokens(row, args.max_output_tokens_cap))
-        request = {
-            **row,
-            "id": request_id,
-            "max_tokens": max_tokens,
-        }
-
-        now = perf_counter()
+    for entry in entries:
+        base, paths, metadata, now = submit_request_entry(
+            args,
+            entry,
+            work_dir,
+            scheduler_runtime=scheduler_runtime,
+        )
         first_submit_t = now if first_submit_t is None else first_submit_t
         submit_times[base] = now
         paths_by_base[base] = paths
-        metadata_by_base[base] = {
-            "phase": phase,
-            "request_index": idx,
-            "measure_index": measure_index,
-            "request_id": request_id,
-            "profile": row.get("profile"),
-            "input_tokens_dataset": row.get("input_tokens"),
-            "max_tokens": max_tokens,
-            "target_output_tokens": row.get("max_tokens", row.get("output_len")),
-            "total_tokens_dataset": row.get("total_tokens"),
-        }
-        atomic_write_json(paths["request"], request)
+        metadata_by_base[base] = metadata
 
     return paths_by_base, metadata_by_base, submit_times, first_submit_t
 
 
+def run_closed_loop_requests(args, entries, work_dir: Path, scheduler_runtime=None):
+    """闭环提交请求：维持固定 inflight 数，完成一条后补交下一条。"""
+    paths_by_base = {}
+    metadata_by_base = {}
+    submit_times = {}
+    completed_at = {}
+    first_submit_t = None
+    last_done_t = None
+    next_entry_idx = 0
+    max_inflight = max(1, args.concurrency)
+    last_activity_t = time.time()
+
+    def submit_until_full():
+        """内部 helper：在 inflight 小于 concurrency 时持续写入新 request。"""
+        nonlocal first_submit_t, next_entry_idx, last_activity_t
+        while next_entry_idx < len(entries):
+            inflight = len(paths_by_base) - len(completed_at)
+            if inflight >= max_inflight:
+                break
+            base, paths, metadata, now = submit_request_entry(
+                args,
+                entries[next_entry_idx],
+                work_dir,
+                scheduler_runtime=scheduler_runtime,
+            )
+            first_submit_t = now if first_submit_t is None else first_submit_t
+            submit_times[base] = now
+            paths_by_base[base] = paths
+            metadata_by_base[base] = metadata
+            next_entry_idx += 1
+            last_activity_t = time.time()
+
+    submit_until_full()
+    while len(completed_at) < len(entries):
+        raise_if_worker_error(paths_by_base)
+        made_progress = False
+        for base, paths in list(paths_by_base.items()):
+            if base in completed_at:
+                continue
+            if paths["decode_done"].exists():
+                completed_at[base] = perf_counter()
+                last_done_t = completed_at[base]
+                made_progress = True
+
+        if made_progress:
+            last_activity_t = time.time()
+            submit_until_full()
+        elif time.time() - last_activity_t > args.request_timeout_s:
+            missing = sorted(set(paths_by_base) - set(completed_at))
+            raise TimeoutError(f"timed out waiting decode_done for {missing[:5]}")
+        else:
+            time.sleep(args.poll_interval_s)
+
+    return paths_by_base, metadata_by_base, submit_times, completed_at, first_submit_t, last_done_t
+
+
 def build_metrics_rows(args, paths_by_base, metadata_by_base, submit_times, completed_at):
+    """读取每条请求的 prefill/decode metrics，并合成统一的逐请求 benchmark 行。"""
     rows = []
     for base in sorted(paths_by_base):
         paths = paths_by_base[base]
@@ -251,8 +416,10 @@ def build_metrics_rows(args, paths_by_base, metadata_by_base, submit_times, comp
                 **meta,
                 "kv_cache_quant_mode": args.kv_cache_quant_mode,
                 "kv_transfer_backend": args.kv_transfer_backend,
-                "prefill_gpu": args.prefill_gpu,
-                "decode_gpu": args.decode_gpu,
+                "prefill_gpu": meta.get("prefill_gpu", getattr(args, "prefill_gpu", None)),
+                "decode_gpu": meta.get("decode_gpu", getattr(args, "decode_gpu", None)),
+                "load_mode": args.load_mode,
+                "concurrency": args.concurrency,
                 "prefill_time_s": prefill_time_s,
                 "payload_write_time_s": payload_write_time_s,
                 "transfer_wait_time_s": transfer_wait_time_s,
@@ -281,6 +448,7 @@ def build_metrics_rows(args, paths_by_base, metadata_by_base, submit_times, comp
 
 
 def parse_args():
+    """解析 pipeline PD benchmark 参数，包括传输后端、decode 模式、调度器和并发配置。"""
     parser = argparse.ArgumentParser(description="Pipeline dual-GPU PD synthetic benchmark.")
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
     parser.add_argument("--limit", type=int, default=5)
@@ -314,16 +482,48 @@ def parse_args():
     parser.add_argument("--max-active-decode-requests", type=int, default=4)
     parser.add_argument("--max-pending-sends", type=int, default=4)
     parser.add_argument("--max-pending-recvs", type=int, default=4)
+    parser.add_argument(
+        "--scheduler",
+        default="none",
+        choices=["none", "round_robin", "load_aware", "affinity_load_aware"],
+        help="Agent-aware virtual worker-slot scheduler used by the benchmark driver.",
+    )
+    parser.add_argument(
+        "--num-worker-slots",
+        type=int,
+        default=1,
+        help="Number of virtual worker slots for --scheduler round_robin/load_aware.",
+    )
+    parser.add_argument(
+        "--initial-backlog-s",
+        default="",
+        help="Comma-separated virtual backlog seconds for worker slots, e.g. 0,30,0,60.",
+    )
+    parser.add_argument(
+        "--load-mode",
+        default="batch",
+        choices=["batch", "closed_loop"],
+        help="Request submit policy used by the measure phase.",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=4,
+        help="Max in-flight requests for --load-mode closed_loop.",
+    )
     return parser.parse_args()
 
 
 def main():
+    """pipeline PD benchmark 主入口：启动 worker、提交 warmup/measure、汇总并关闭。"""
     args = parse_args()
     if args.kv_transfer_backend == "sync_gpu" and args.decode_mode != "continuous":
         raise ValueError(
             "sync_gpu requires --decode-mode continuous; "
             "run_to_finish still waits for prefill_done and can deadlock."
         )
+    if args.scheduler != "none" and args.num_worker_slots < 1:
+        raise ValueError("--num-worker-slots must be positive when scheduler is enabled")
 
     mode = result_mode(args)
     args.work_dir = args.work_dir or default_work_dir(mode, args.profile)
@@ -352,6 +552,7 @@ def main():
         wait_for_file(work_dir / "decode_worker.ready.json", args.startup_timeout_s)
         prefill_ready = read_json(work_dir / "prefill_worker.ready.json")
         decode_ready = read_json(work_dir / "decode_worker.ready.json")
+        scheduler_runtime = build_scheduler_runtime(args)
 
         warmup_entries = [
             (idx, row, "warmup", None)
@@ -371,7 +572,12 @@ def main():
                 warmup_metadata,
                 warmup_submit_times,
                 warmup_first_submit_t,
-            ) = submit_requests(args, warmup_entries, work_dir)
+            ) = submit_requests(
+                args,
+                warmup_entries,
+                work_dir,
+                scheduler_runtime=scheduler_runtime,
+            )
             warmup_completed_at = wait_for_all_decode_done(
                 warmup_paths,
                 warmup_submit_times,
@@ -388,18 +594,38 @@ def main():
                 )
             )
 
-        (
-            measure_paths,
-            measure_metadata,
-            measure_submit_times,
-            measure_first_submit_t,
-        ) = submit_requests(args, measure_entries, work_dir)
-        measure_completed_at = wait_for_all_decode_done(
-            measure_paths,
-            measure_submit_times,
-            timeout_s=args.request_timeout_s,
-        )
-        measure_last_done_t = max(measure_completed_at.values())
+        if args.load_mode == "closed_loop":
+            (
+                measure_paths,
+                measure_metadata,
+                measure_submit_times,
+                measure_completed_at,
+                measure_first_submit_t,
+                measure_last_done_t,
+            ) = run_closed_loop_requests(
+                args,
+                measure_entries,
+                work_dir,
+                scheduler_runtime=scheduler_runtime,
+            )
+        else:
+            (
+                measure_paths,
+                measure_metadata,
+                measure_submit_times,
+                measure_first_submit_t,
+            ) = submit_requests(
+                args,
+                measure_entries,
+                work_dir,
+                scheduler_runtime=scheduler_runtime,
+            )
+            measure_completed_at = wait_for_all_decode_done(
+                measure_paths,
+                measure_submit_times,
+                timeout_s=args.request_timeout_s,
+            )
+            measure_last_done_t = max(measure_completed_at.values())
         all_rows.extend(
             build_metrics_rows(
                 args,
@@ -473,6 +699,19 @@ def main():
                 "kv_transfer_backend": args.kv_transfer_backend,
                 "nccl_port": args.nccl_port,
                 "decode_mode": args.decode_mode,
+                "load_mode": args.load_mode,
+                "concurrency": args.concurrency,
+                "scheduler": args.scheduler,
+                "num_worker_slots": args.num_worker_slots,
+                "initial_backlog_s": parse_initial_backlogs(
+                    args.initial_backlog_s,
+                    args.num_worker_slots,
+                ),
+                "agent_scheduler_workers": (
+                    worker_summary(scheduler_runtime["workers"])
+                    if scheduler_runtime is not None
+                    else None
+                ),
                 "max_active_decode_requests": args.max_active_decode_requests,
                 "max_pending_sends": args.max_pending_sends,
                 "max_pending_recvs": args.max_pending_recvs,

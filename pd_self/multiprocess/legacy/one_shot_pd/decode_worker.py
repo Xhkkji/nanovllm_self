@@ -3,12 +3,14 @@ import json
 import os
 import pickle
 import sys
+from pathlib import Path
 from time import perf_counter
 
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+# Legacy one-shot decode worker。
+# 当前主线使用 persistent_decode_worker.py；该文件只作为早期 demo 归档保留。
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 from transformers import AutoTokenizer
@@ -21,11 +23,13 @@ from pd_self.kv_store import SharedMemoryKVStoreBackend
 
 
 def sync_cuda():
+    """在有 CUDA 时同步当前设备，用于把计时边界对齐到 GPU 实际完成时间。"""
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
 
 def build_config(args):
+    """构造 decode worker 使用的最小 nano-vLLM Config，保持和 prefill 侧 KV 形状一致。"""
     return Config(
         model_path=args.model_path,
         device="cuda:0",
@@ -41,6 +45,7 @@ def build_config(args):
 
 
 def main():
+    """短生命周期 decode demo 入口：读取 prefill payload，恢复 KV，并执行一次或完整 decode。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", default="/home/xhk/model/Qwen3-0.6B/")
     parser.add_argument("--infile", default="/tmp/nanovllm_pd_payload.pkl")

@@ -35,17 +35,28 @@ from pd_self.multiprocess.control_plane import control_socket_path, make_control
 
 
 def sync_cuda():
+    """同步当前 CUDA 设备，保证 restore/decode 相关计时覆盖真实 GPU 执行时间。"""
     # CUDA kernel 是异步提交的；benchmark 计时必须同步后再读 perf_counter。
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
 
+def destroy_process_group(args) -> None:
+    """销毁 NCCL process group。"""
+    if not torch.distributed.is_initialized():
+        return
+    torch.distributed.destroy_process_group()
+
+
 def build_config(args):
-    # decode 进程同样只看自己的 cuda:0。
-    # 物理 GPU 由启动脚本设置 CUDA_VISIBLE_DEVICES 控制。
+    """构造常驻 decode worker 的 nano-vLLM 配置，并与 prefill worker 的 KV 配置对齐。"""
+    # 单 pair 模式下 local_cuda_device 默认是 0；
+    # pool 模式下 driver 会让所有 worker 看见同一份 pool GPU 列表，
+    # 再用 --local-cuda-device 指定当前 worker 真正使用哪张本地可见卡。
+    device = f"cuda:{args.local_cuda_device}"
     return Config(
         model_path=args.model_path,
-        device="cuda:0",
+        device=device,
         max_num_seqs=4,
         max_num_batched_tokens=512,
         max_model_len=512,
@@ -58,6 +69,7 @@ def build_config(args):
 
 
 def atomic_write_json(path: Path, obj) -> None:
+    """原子写 metrics/error JSON，避免 driver 在文件半写入时读取。"""
     # 防止 driver 读到半写入的 metrics/error JSON。
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     with tmp_path.open("w", encoding="utf-8") as f:
@@ -65,7 +77,40 @@ def atomic_write_json(path: Path, obj) -> None:
     tmp_path.replace(path)
 
 
+def write_worker_state(
+    args,
+    work_dir: Path,
+    active_requests: dict | None = None,
+    pending_recvs: dict | None = None,
+    processed_bases: set | None = None,
+    busy: bool = False,
+) -> None:
+    """写出 decode worker 当前状态，供多 PD pair driver 做真实 worker feedback 调度。"""
+    # Agent-aware / Runtime feedback：
+    # 外层调度器不直接读取 DecodeEngine 内部对象，而是通过这个轻量 JSON
+    # 获得 active decode 数、pending recv 数等信号。这样保持调度层和引擎内部解耦。
+    active_requests = active_requests or {}
+    pending_recvs = pending_recvs or {}
+    processed_bases = processed_bases or set()
+    atomic_write_json(
+        work_dir / args.state_file,
+        {
+            "role": "persistent_decode",
+            "updated_time_s": time.time(),
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "decode_mode": args.decode_mode,
+            "busy": busy,
+            "active_decode_requests": len(active_requests),
+            "pending_recvs": len(pending_recvs),
+            "processed_bases": len(processed_bases),
+            "max_active_decode_requests": args.max_active_decode_requests,
+            "max_pending_recvs": args.max_pending_recvs,
+        },
+    )
+
+
 def request_base(done_path: Path) -> str:
+    """从 xxx.prefill_done 文件名提取请求 base，用于找到同请求的 payload/metrics。"""
     # decode worker 以 prefill_done 作为“可以开始 restore”的信号。
     # base 用来找到同一条请求的 payload / metrics / done 文件。
     suffix = ".prefill_done"
@@ -88,6 +133,7 @@ def payload_ready_base(ready_path: Path) -> str:
     return name[: -len(suffix)]
 
 def is_sync_gpu_backend(args) -> bool:
+    """判断当前 decode worker 是否使用 sync_gpu/NCCL 传输后端。"""
     return getattr(args, "kv_transfer_backend", "shared_memory") == "sync_gpu"
 
 
@@ -116,6 +162,7 @@ def build_paths(work_dir: Path, base: str):
 
 
 def run_decode_to_finish(engine):
+    """旧 run_to_finish 模式：单条 payload restore 后持续 step，直到 scheduler 全部完成。"""
     # DecodeEngine.step() 每次推进一轮调度。
     # 对单请求来说，通常一轮生成一个 token；多请求时可能调度多个 seq。
     # 这里循环到 scheduler 为空，表示这条 payload 恢复出的 seq 已全部完成。
@@ -143,6 +190,7 @@ def run_decode_to_finish(engine):
 
 
 def process_payload(args, engine, done_path: Path):
+    """旧 shared_memory 串行路径：读取 payload、restore KV、完整 decode 并写完成文件。"""
     # 处理单条已经 prefill_done 的请求。
     #
     # 输入：
@@ -304,12 +352,25 @@ def submit_async_recv_for_continuous(args, backend, work_dir: Path, base: str, c
     # torch.distributed.irecv 在 NCCL 后端下可能也会等待对端 isend 进入。
     # 所以这里先通知 prefill 可以提交 isend，再提交本端 irecv，
     # 避免 “decode 卡在 irecv / prefill 卡在等 recv_ready” 的死锁。
-    control.send(
-        {
-            "type": "recv_ready",
-            "base": base,
-        }
-    )
+    if args.pool_mode:
+        # ########################### NCCL 池化 PD 文件握手 ###########################
+        # 池化后，一个 decode worker 可能接收多个 prefill worker 的 payload。
+        # 为了避免维护多条 socket 连接，第一版直接用文件作为 recv_ready。
+        #
+        # 时序：
+        #   1. decode 看到 payload_ready
+        #   2. decode 读 payload，知道 src_rank / shape / dtype
+        #   3. decode 写 recv_ready
+        #   4. prefill 看到 recv_ready 后提交 isend
+        #   5. decode 提交 irecv 并等待完成
+        paths["recv_ready"].write_text("ready\n", encoding="utf-8")
+    else:
+        control.send(
+            {
+                "type": "recv_ready",
+                "base": base,
+            }
+        )
 
     recv_state = backend.submit_recv_by_ref(
         kv_ref=meta.storage_ref,
@@ -328,6 +389,7 @@ def submit_async_recv_for_continuous(args, backend, work_dir: Path, base: str, c
 
 
 def active_state_to_metrics(args, state):
+    """把 DecodeEngine 的 active/finished 状态转换成 benchmark 可以落盘的 metrics 字典。"""
     # 把 DecodeEngine 内部状态转换成 benchmark JSON。
     # 这里不反向访问 Sequence，因为 finished 后 Sequence 已经从 scheduler.running 释放。
     return {
@@ -356,6 +418,7 @@ def active_state_to_metrics(args, state):
 
 
 def finish_continuous_request(args, paths, state):
+    """continuous 模式下完成单条请求：先写 decode metrics，再写 decode_done 信号。"""
     # 一条 continuous active request 完成时，统一落盘 metrics 和 done。
     # decode_done 必须在 metrics 原子写完之后再写，避免 driver 先看到 done 后读不到 metrics。
     metrics = active_state_to_metrics(args, state)
@@ -405,55 +468,71 @@ def run_continuous_decode_loop(args, engine, work_dir: Path, control=None):
     empty_steps = 0
     max_empty_steps = 10000
     shutdown_path = work_dir / args.shutdown_file
+    write_worker_state(args, work_dir, active_requests, pending_recvs, processed_bases)
 
     while not shutdown_path.exists() or active_requests or pending_recvs:
         made_progress = False
+        write_worker_state(
+            args,
+            work_dir,
+            active_requests,
+            pending_recvs,
+            processed_bases,
+            busy=bool(active_requests or pending_recvs),
+        )
         
         if is_sync_gpu_backend(args):
-            signal_bases = []
-            if len(pending_recvs) < args.max_pending_recvs:
-                # 没有 active request 时，可以稍微等一下 socket；
-                # 有 active request 时，不阻塞 decode step。
-                #
-                # 异步 PD 这里看 pending_recvs 容量，而不是 active_requests。
-                # 收到 payload_ready 后会先进入 pending_recvs，不会立刻占用 active slot。
-                poll_timeout = args.poll_interval_s if not active_requests else 0.0
-                try:
-                    msg = recv_control_message(control, poll_timeout)
-                except EOFError:
-                    if not active_requests and not pending_recvs:
-                        break
-                    control = None
-                    msg = None
+            if args.pool_mode:
+                # ########################### NCCL 池化 PD decode 入口 ###########################
+                # decode worker 只扫描自己的 work_dir。
+                # 任意 prefill worker 如果选择了这个 decode，都会把 payload_ready 写到这里。
+                ready_paths = sorted(work_dir.glob("*.payload_ready"))
+                signal_bases = [payload_ready_base(path) for path in ready_paths]
+        
+            else:
+                signal_bases = []
+                if len(pending_recvs) < args.max_pending_recvs:
+                    # 没有 active request 时，可以稍微等一下 socket；
+                    # 有 active request 时，不阻塞 decode step。
+                    #
+                    # 异步 PD 这里看 pending_recvs 容量，而不是 active_requests。
+                    # 收到 payload_ready 后会先进入 pending_recvs，不会立刻占用 active slot。
+                    poll_timeout = args.poll_interval_s if not active_requests else 0.0
+                    try:
+                        msg = recv_control_message(control, poll_timeout)
+                    except EOFError:
+                        if not active_requests and not pending_recvs:
+                            break
+                        control = None
+                        msg = None
 
-                if msg is not None:
+                    if msg is not None:
+                        if msg.get("type") != "payload_ready":
+                            raise RuntimeError(f"unexpected control message: {msg}")
+                        signal_bases.append(msg["base"])
+                
+                # 尽量把 socket 里已经到达的 payload_ready 一次性捞出来，
+                # 但不要超过 max_active_decode_requests。
+                while(
+                    control is not None
+                    and len(pending_recvs) + len(signal_bases) < args.max_pending_recvs
+                ):
+                    try:
+                        msg = recv_control_message(control, 0.0)
+                    except EOFError:
+                        control = None
+                        break
+                    if msg is None:
+                        break
                     if msg.get("type") != "payload_ready":
                         raise RuntimeError(f"unexpected control message: {msg}")
                     signal_bases.append(msg["base"])
-            
-            # 尽量把 socket 里已经到达的 payload_ready 一次性捞出来，
-            # 但不要超过 max_active_decode_requests。
-            while(
-                control is not None
-                and len(pending_recvs) + len(signal_bases) < args.max_pending_recvs
-            ):
-                try:
-                    msg = recv_control_message(control, 0.0)
-                except EOFError:
-                    control = None
-                    break
-                if msg is None:
-                    break
-                if msg.get("type") != "payload_ready":
-                    raise RuntimeError(f"unexpected control message: {msg}")
-                signal_bases.append(msg["base"])
-            signal_paths = []
+                signal_paths = []
 
         else:
             signal_bases = []
             signal_paths = sorted(work_dir.glob("*.prefill_done"))
 
-        
         signals = signal_bases if is_sync_gpu_backend(args) else signal_paths
         for signal in signals:
             if is_sync_gpu_backend(args):
@@ -559,6 +638,14 @@ def run_continuous_decode_loop(args, engine, work_dir: Path, control=None):
 
                 pending_recvs.pop(base, None)
                 made_progress = True
+                write_worker_state(
+                    args,
+                    work_dir,
+                    active_requests,
+                    pending_recvs,
+                    processed_bases,
+                    busy=True,
+                )
 
                 if finished_state is not None:
                     finish_continuous_request(args, item["paths"], finished_state)
@@ -592,12 +679,21 @@ def run_continuous_decode_loop(args, engine, work_dir: Path, control=None):
                     continue
 
                 finish_continuous_request(args, entry["paths"], state)
+                write_worker_state(
+                    args,
+                    work_dir,
+                    active_requests,
+                    pending_recvs,
+                    processed_bases,
+                    busy=bool(active_requests or pending_recvs),
+                )
 
         if not made_progress:
             time.sleep(args.poll_interval_s)
 
 
 def parse_args():
+    """解析常驻 decode worker 参数，包括 decode 模式、传输后端和异步 recv 上限。"""
     parser = argparse.ArgumentParser(description="Persistent decode worker for local PD benchmark.")
     parser.add_argument("--model-path", default="/home/xhk/model/Qwen3-0.6B/")
     parser.add_argument("--work-dir", required=True)
@@ -630,10 +726,20 @@ def parse_args():
         help="KV transfer backend. sync_gpu scans payload_ready instead of prefill_done.",
     )
     parser.add_argument("--nccl-port", default="29577")
+    parser.add_argument("--state-file", default="decode_worker_state.json")
+    
+    # 池化
+    parser.add_argument("--global-rank", type=int, default=1)
+    parser.add_argument("--world-size", type=int, default=2)
+    parser.add_argument("--pool-mode", action="store_true")
+    parser.add_argument("--decode-worker-id", type=int, default=0)
+    parser.add_argument("--local-cuda-device", type=int, default=0)
+    
     return parser.parse_args()
 
 
 def main():
+    """常驻 decode worker 主入口：初始化模型/控制面，持续接收 payload 并执行 decode。"""
     args = parse_args()
     
     if args.kv_transfer_backend == "sync_gpu":
@@ -648,26 +754,35 @@ def main():
     
     control_listener = None
     control = None
-    if args.kv_transfer_backend == "sync_gpu":
+    if args.kv_transfer_backend == "sync_gpu" and not args.pool_mode:
         control_listener = make_control_listener(
             control_socket_path(work_dir)
         )
     
     if args.kv_transfer_backend == "sync_gpu":
-        torch.cuda.set_device(0)
+        torch.cuda.set_device(args.local_cuda_device)
+        # ########################### NCCL 池化 PD 初始化 ###########################
+        # decode worker 使用 global rank 加入同一个 NCCL world。
+        # 它后续根据 payload.transfer_meta.storage_ref.src_rank 接收来自任意 prefill 的 KV。
+        
         torch.distributed.init_process_group(
             backend="nccl",
             init_method=f"tcp://127.0.0.1:{args.nccl_port}",
-            rank=1,
-            world_size=2,
+            rank=args.global_rank,
+            world_size=args.world_size,
+            # ########################### NCCL 池化 PD 本地设备绑定 ###########################
+            # ########################### NCCL 池化 PD 本地设备绑定 ###########################
+            # pool 模式下 global_rank 表示通信身份，local_cuda_device 表示本进程用的本地 GPU。
+            # 这两个概念必须拆开；否则 rank 2/3 很容易被误当成本地 cuda:2/cuda:3。
+            device_id=torch.device(f"cuda:{args.local_cuda_device}"),
         )
-        backend = SyncGpuKVStoreBackend(rank=1, peer_rank=0)
+        backend = SyncGpuKVStoreBackend(rank=args.global_rank, peer_rank=None)
     else:
         backend = SharedMemoryKVStoreBackend()
 
     print("cuda_visible_devices", os.environ.get("CUDA_VISIBLE_DEVICES"), flush=True)
     print("torch_current_device", torch.cuda.current_device(), flush=True)
-    print("torch_device_name", torch.cuda.get_device_name(0), flush=True)
+    print("torch_device_name", torch.cuda.get_device_name(args.local_cuda_device), flush=True)
 
     
     init_t0 = perf_counter()
@@ -694,7 +809,7 @@ def main():
     sync_cuda()
     init_time_s = perf_counter() - init_t0
     
-    if args.kv_transfer_backend == "sync_gpu":
+    if args.kv_transfer_backend == "sync_gpu" and not args.pool_mode:
         control = control_listener.accept()
 
     atomic_write_json(
@@ -703,7 +818,7 @@ def main():
             "role": "persistent_decode",
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
             "torch_current_device": int(torch.cuda.current_device()),
-            "torch_device_name": torch.cuda.get_device_name(0),
+            "torch_device_name": torch.cuda.get_device_name(args.local_cuda_device),
             "kv_cache_quant_mode": args.kv_cache_quant_mode,
             "kv_transfer_backend": args.kv_transfer_backend,
             "control_connected": control is not None,
@@ -716,6 +831,7 @@ def main():
     
     # ready 文件通知 driver：decode 侧模型和 KV cache 已准备好。
     print("persistent_decode_ready", work_dir / args.ready_file, flush=True)
+    write_worker_state(args, work_dir)
 
     try:
         if args.decode_mode == "continuous":
@@ -727,6 +843,11 @@ def main():
         while not (work_dir / args.shutdown_file).exists():
             done_paths = sorted(work_dir.glob("*.prefill_done"))
             made_progress = False
+            write_worker_state(
+                args,
+                work_dir,
+                busy=False,
+            )
             for done_path in done_paths:
                 base = request_base(done_path)
                 paths = build_paths(work_dir, base)
@@ -738,7 +859,17 @@ def main():
                     continue
                 made_progress = True
                 try:
+                    write_worker_state(
+                        args,
+                        work_dir,
+                        busy=True,
+                    )
                     process_payload(args, engine, done_path)
+                    write_worker_state(
+                        args,
+                        work_dir,
+                        busy=False,
+                    )
                 except Exception as exc:
                     # 写 error 文件而不是让 worker 直接退出，方便 driver 报出具体请求的错误。
                     atomic_write_json(
@@ -756,8 +887,8 @@ def main():
             control.close()
         if control_listener is not None:
             control_listener.close()
-        if args.kv_transfer_backend == "sync_gpu" and torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
+        if args.kv_transfer_backend == "sync_gpu":
+            destroy_process_group(args)
         print("persistent_decode_shutdown", flush=True)
 
 

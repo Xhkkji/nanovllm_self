@@ -8,6 +8,7 @@ DEFAULT_RESULT_DIR = "pd_self/multiprocess/result"
 
 
 def profile_dir_name(profile):
+    """把 profile 名称转换成安全的目录名，用于把不同负载类型的结果分开保存。"""
     if not profile:
         return "all"
     safe = []
@@ -20,22 +21,27 @@ def profile_dir_name(profile):
 
 
 def benchmark_result_dir(mode, profile):
+    """根据 benchmark 模式和 profile 生成统一 result 目录。"""
     return Path(DEFAULT_RESULT_DIR) / mode / profile_dir_name(profile)
 
 
 def default_metrics_path(mode, profile):
+    """返回某个 benchmark 默认的逐请求 metrics.jsonl 路径。"""
     return str(benchmark_result_dir(mode, profile) / "synthetic_metrics.jsonl")
 
 
 def default_summary_path(mode, profile):
+    """返回某个 benchmark 默认的 summary.json 路径。"""
     return str(benchmark_result_dir(mode, profile) / "synthetic_summary.json")
 
 
 def default_work_dir(mode, profile):
+    """返回 persistent/pipeline worker 使用的默认 work_dir。"""
     return str(benchmark_result_dir(mode, profile) / "work")
 
 
 def default_compare_path(profile, pd_mode="persistent_pd"):
+    """返回 single-GPU 与 PD 对比 summary 的默认输出路径。"""
     return str(
         Path(DEFAULT_RESULT_DIR)
         / "compare"
@@ -45,6 +51,7 @@ def default_compare_path(profile, pd_mode="persistent_pd"):
 
 
 def load_jsonl(path):
+    """逐行读取 JSONL 数据集，供 synthetic/ShareGPT/Agent trace benchmark 复用。"""
     with Path(path).open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -53,6 +60,7 @@ def load_jsonl(path):
 
 
 def write_jsonl(path, rows):
+    """写逐请求 metrics.jsonl，并自动创建父目录。"""
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as f:
@@ -61,6 +69,7 @@ def write_jsonl(path, rows):
 
 
 def write_json(path, obj):
+    """写 summary/compare JSON，并自动创建父目录。"""
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as f:
@@ -68,6 +77,7 @@ def write_json(path, obj):
 
 
 def select_requests(path, limit, profile=None, max_total_tokens=2048):
+    """从数据集中按 profile 和总 token 上限筛选 benchmark 请求。"""
     rows = []
     for row in load_jsonl(path):
         if profile and row.get("profile") != profile:
@@ -81,6 +91,7 @@ def select_requests(path, limit, profile=None, max_total_tokens=2048):
 
 
 def percentile(values, pct):
+    """计算百分位数，用于 summary 里的 p50/p90 等统计。"""
     if not values:
         return None
     values = sorted(values)
@@ -94,6 +105,7 @@ def percentile(values, pct):
 
 
 def summarize(rows, time_keys):
+    """汇总逐请求 metrics，输出请求数、生成 token 数、耗时分布和吞吐。"""
     summary = {
         "num_requests": len(rows),
         "profiles": sorted({row.get("profile") for row in rows if row.get("profile")}),
@@ -121,6 +133,7 @@ def summarize(rows, time_keys):
 
 
 def cap_max_tokens(row, cap):
+    """根据数据集里的 max_tokens/output_len 和命令行 cap 得到本次生成长度上限。"""
     max_tokens = int(row.get("max_tokens", row.get("output_len", 1)))
     if cap and cap > 0:
         max_tokens = min(max_tokens, cap)

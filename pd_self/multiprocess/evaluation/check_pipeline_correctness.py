@@ -7,11 +7,13 @@ ROOT_DIR = Path(__file__).resolve().parents[3]
 
 
 def read_json(path: Path):
+    """读取 JSON 文件，主要用于加载每条请求对应的 decode_metrics。"""
     with path.open(encoding="utf-8") as f:
         return json.load(f)
 
 
 def read_jsonl(path: Path):
+    """读取 metrics.jsonl，并返回所有逐请求记录。"""
     rows = []
     with path.open(encoding="utf-8") as f:
         for line in f:
@@ -22,6 +24,7 @@ def read_jsonl(path: Path):
 
 
 def resolve_path(path: str) -> Path:
+    """把相对路径解析到仓库根目录，方便脚本从任意工作目录执行。"""
     p = Path(path)
     if p.is_absolute():
         return p
@@ -29,6 +32,7 @@ def resolve_path(path: str) -> Path:
 
 
 def load_rows_by_request(metrics_path: Path, include_warmup: bool):
+    """按 request_id 建索引，便于左右两份 benchmark 输出逐请求对拍。"""
     rows = {}
     for row in read_jsonl(metrics_path):
         if not include_warmup and row.get("phase") != "measure":
@@ -62,6 +66,7 @@ def comparable_decode_fields(row):
 
 
 def main():
+    """对比两份 pipeline PD 输出，检查生成 token 序列和长度是否一致。"""
     parser = argparse.ArgumentParser(
         description="Compare pipeline PD correctness between two benchmark outputs."
     )

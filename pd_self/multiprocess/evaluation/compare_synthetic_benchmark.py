@@ -18,21 +18,25 @@ from benchmark_synthetic_common import (
 
 
 def read_json(path):
+    """读取一个 benchmark summary JSON。"""
     with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
 def get_avg(summary, key):
+    """从 summary.time 中取某个耗时字段的平均值，字段不存在时返回 None。"""
     return summary.get("time", {}).get(key, {}).get("avg")
 
 
 def ratio(numerator, denominator):
+    """计算两个指标的比值，分母为空或为 0 时返回 None。"""
     if denominator in (None, 0):
         return None
     return numerator / denominator
 
 
 def parse_args():
+    """解析 single-GPU 与 PD summary 对比脚本参数。"""
     parser = argparse.ArgumentParser(description="Compare single-GPU and PD benchmark summaries.")
     parser.add_argument("--profile", default=None)
     parser.add_argument("--pd-mode", default="persistent_pd", choices=["persistent_pd", "pipeline_pd"])
@@ -43,6 +47,7 @@ def parse_args():
 
 
 def main():
+    """读取 single/PD 两份 summary，计算延迟、吞吐和 PD 分段耗时对比。"""
     args = parse_args()
     args.single = args.single or default_summary_path("single_gpu", args.profile)
     args.pd = args.pd or default_summary_path(args.pd_mode, args.profile)

@@ -2,8 +2,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-/home/xhk/miniconda3/envs/pytorch/bin/python}"
+
+# Legacy one-shot PD demo。
+# 当前主线使用 run_pipeline_pd_benchmark.sh / run_pipeline_profile_matrix.sh。
 
 PREFILL_GPU="${PREFILL_GPU:-0}"
 DECODE_GPU="${DECODE_GPU:-1}"
@@ -36,7 +39,7 @@ trap cleanup EXIT
 
 echo "[dual-gpu-pd] starting prefill worker on GPU ${PREFILL_GPU}"
 CUDA_VISIBLE_DEVICES="${PREFILL_GPU}" "${PYTHON_BIN}" \
-  pd_self/multiprocess/prefill_worker.py \
+  pd_self/multiprocess/legacy/one_shot_pd/prefill_worker.py \
   --prompt "${PROMPT}" \
   --kv-cache-quant-mode "${KV_CACHE_QUANT_MODE}" \
   --out "${PAYLOAD_FILE}" \
@@ -66,7 +69,7 @@ fi
 
 echo "[dual-gpu-pd] starting decode worker on GPU ${DECODE_GPU}"
 CUDA_VISIBLE_DEVICES="${DECODE_GPU}" "${PYTHON_BIN}" \
-  pd_self/multiprocess/decode_worker.py \
+  pd_self/multiprocess/legacy/one_shot_pd/decode_worker.py \
   --kv-cache-quant-mode "${KV_CACHE_QUANT_MODE}" \
   --infile "${PAYLOAD_FILE}" \
   --done-file "${DONE_FILE}" \

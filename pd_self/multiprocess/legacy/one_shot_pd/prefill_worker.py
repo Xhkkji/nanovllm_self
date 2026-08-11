@@ -4,12 +4,14 @@ import os
 import pickle
 import sys
 import time
+from pathlib import Path
 from time import perf_counter
 
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+# Legacy one-shot prefill worker。
+# 当前主线使用 persistent_prefill_worker.py；该文件只作为早期 demo 归档保留。
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from transformers import AutoTokenizer
 import torch
@@ -22,11 +24,13 @@ from pd_self.prefill_engine import PrefillEngine
 
 
 def sync_cuda():
+    """在有 CUDA 时同步当前设备，用于让 prefill/写 payload 的计时更接近真实 GPU 时间。"""
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
 
 def build_config(args):
+    """构造 prefill worker 使用的最小 nano-vLLM Config，并保证与 decode 侧 KV 配置一致。"""
     return Config(
         model_path=args.model_path,
         device="cuda:0",
@@ -42,6 +46,7 @@ def build_config(args):
     
     
 def main():
+    """短生命周期 prefill demo 入口：加载请求，执行 prefill，把 KV payload 写给 decode 侧。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", default="/home/xhk/model/Qwen3-0.6B/")
     parser.add_argument("--prompt", default="What is KV cache?")

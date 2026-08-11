@@ -52,6 +52,12 @@ def _tool_key(content: str):
 
 
 def trim_messages(messages: list[dict], max_context_chars: int = 8000, max_tool_chars: int = 3000) -> list[dict]:
+    """
+    这段代码实现了一个智能的消息修剪（Trimming）函数，用于在将消息列表发送给大语言模型（LLM）之前，
+    确保其总长度（以字符数估算）不超过预设的上下文窗口限制。
+
+    它的核心策略是从最新的消息开始，尽可能多地保留最近的消息，同时智能地去重工具（Tool）调用的结果。
+    """
     kept = []
     total = 0
     seen_tool_keys = set()

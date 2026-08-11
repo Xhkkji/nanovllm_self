@@ -1,5 +1,6 @@
 # Python cache / bytecode
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 
@@ -8,10 +9,33 @@ logs/
 *.log
 
 # Local benchmark datasets and generated data
-data/
+# 真实/Tokenized benchmark 数据通常较大，默认不提交；README 和小型 summary 可保留。
+data/serving_benchmarks/*.jsonl
+data/serving_benchmarks/ShareGPT_*.json
 
 # PD benchmark / worker outputs
+# benchmark 结果默认都视为生成产物，避免 git add . 一次性带入大量历史结果。
+# 如需提交精选 summary/correctness JSON，可用 git add -f 单独加入。
 pd_self/multiprocess/result/
+
+# work 目录是文件协议控制面和 payload 中间产物，不能进仓库。
+pd_self/multiprocess/result/**/work/
+pd_self/multiprocess/result/**/*_work/
+pd_self/multiprocess/result/**/*.payload.pkl
+pd_self/multiprocess/result/**/*.request.json
+pd_self/multiprocess/result/**/*.payload_ready
+pd_self/multiprocess/result/**/*.recv_ready
+pd_self/multiprocess/result/**/*.prefill_done
+pd_self/multiprocess/result/**/*.decode_done
+pd_self/multiprocess/result/**/*.prefill_metrics.json
+pd_self/multiprocess/result/**/*.decode_metrics.json
+pd_self/multiprocess/result/**/*.error.json
+pd_self/multiprocess/result/**/*.ready.json
+pd_self/multiprocess/result/**/shutdown
+
+# 大体积 benchmark 明细默认不提交；summary/correctness JSON 可按需保留。
+pd_self/multiprocess/result/**/*.jsonl
+pd_self/multiprocess/result/**/*.log
 
 # Temporary runtime files
 *.tmp

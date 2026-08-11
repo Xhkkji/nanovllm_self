@@ -1,0 +1,225 @@
+{
+  "input": "data/serving_benchmarks/sharegpt_qwen3_tokenized_5k.jsonl",
+  "output": "data/serving_benchmarks/agent_trace_qwen3_tokenized.jsonl",
+  "model_path": "/home/xhk/model/Qwen3-0.6B/",
+  "num_programs": 200,
+  "num_requests": 583,
+  "limit_programs": 200,
+  "max_step_input_tokens": 1536,
+  "max_step_output_tokens": 256,
+  "skipped": {},
+  "by_task_kind": {
+    "code_agent": {
+      "count": 117,
+      "input_tokens": {
+        "min": 32,
+        "p50": 60,
+        "p90": 1297,
+        "max": 1536
+      },
+      "output_tokens": {
+        "min": 16,
+        "p50": 121,
+        "p90": 256,
+        "max": 256
+      },
+      "total_tokens": {
+        "min": 48,
+        "p50": 249,
+        "p90": 1326,
+        "max": 1792
+      }
+    },
+    "deep_research_agent": {
+      "count": 24,
+      "input_tokens": {
+        "min": 1066,
+        "p50": 1536,
+        "p90": 1536,
+        "max": 1536
+      },
+      "output_tokens": {
+        "min": 16,
+        "p50": 41,
+        "p90": 128,
+        "max": 256
+      },
+      "total_tokens": {
+        "min": 1102,
+        "p50": 1558,
+        "p90": 1664,
+        "max": 1792
+      }
+    },
+    "simple_agent": {
+      "count": 46,
+      "input_tokens": {
+        "min": 32,
+        "p50": 32,
+        "p90": 134,
+        "max": 217
+      },
+      "output_tokens": {
+        "min": 16,
+        "p50": 35,
+        "p90": 100,
+        "max": 126
+      },
+      "total_tokens": {
+        "min": 48,
+        "p50": 74,
+        "p90": 164,
+        "max": 291
+      }
+    },
+    "tool_agent": {
+      "count": 396,
+      "input_tokens": {
+        "min": 32,
+        "p50": 41,
+        "p90": 600,
+        "max": 1536
+      },
+      "output_tokens": {
+        "min": 16,
+        "p50": 118,
+        "p90": 256,
+        "max": 256
+      },
+      "total_tokens": {
+        "min": 48,
+        "p50": 176,
+        "p90": 729,
+        "max": 1792
+      }
+    }
+  },
+  "by_task_type": {
+    "analyze_code": {
+      "count": 39,
+      "input_tokens": {
+        "min": 32,
+        "p50": 36,
+        "p90": 1032,
+        "max": 1536
+      },
+      "output_tokens": {
+        "min": 16,
+        "p50": 76,
+        "p90": 76,
+        "max": 76
+      },
+      "total_tokens": {
+        "min": 48,
+        "p50": 109,
+        "p90": 1104,
+        "max": 1612
+      }
+    },
+    "final_answer": {
+      "count": 161,
+      "input_tokens": {
+        "min": 32,
+        "p50": 49,
+        "p90": 1071,
+        "max": 1536
+      },
+      "output_tokens": {
+        "min": 16,
+        "p50": 238,
+        "p90": 256,
+        "max": 256
+      },
+      "total_tokens": {
+        "min": 48,
+        "p50": 288,
+        "p90": 1227,
+        "max": 1792
+      }
+    },
+    "final_code": {
+      "count": 39,
+      "input_tokens": {
+        "min": 32,
+        "p50": 72,
+        "p90": 1536,
+        "max": 1536
+      },
+      "output_tokens": {
+        "min": 25,
+        "p50": 256,
+        "p90": 256,
+        "max": 256
+      },
+      "total_tokens": {
+        "min": 57,
+        "p50": 323,
+        "p90": 1571,
+        "max": 1792
+      }
+    },
+    "plan": {
+      "count": 161,
+      "input_tokens": {
+        "min": 32,
+        "p50": 32,
+        "p90": 412,
+        "max": 1536
+      },
+      "output_tokens": {
+        "min": 16,
+        "p50": 56,
+        "p90": 64,
+        "max": 64
+      },
+      "total_tokens": {
+        "min": 48,
+        "p50": 96,
+        "p90": 454,
+        "max": 1556
+      }
+    },
+    "refine_reason": {
+      "count": 6,
+      "input_tokens": {
+        "min": 1536,
+        "p50": 1536,
+        "p90": 1536,
+        "max": 1536
+      },
+      "output_tokens": {
+        "min": 16,
+        "p50": 22,
+        "p90": 128,
+        "max": 128
+      },
+      "total_tokens": {
+        "min": 1552,
+        "p50": 1558,
+        "p90": 1664,
+        "max": 1664
+      }
+    },
+    "tool_reason": {
+      "count": 177,
+      "input_tokens": {
+        "min": 32,
+        "p50": 50,
+        "p90": 1320,
+        "max": 1536
+      },
+      "output_tokens": {
+        "min": 16,
+        "p50": 128,
+        "p90": 128,
+        "max": 128
+      },
+      "total_tokens": {
+        "min": 48,
+        "p50": 169,
+        "p90": 1341,
+        "max": 1664
+      }
+    }
+  }
+}
