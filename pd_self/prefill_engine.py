@@ -26,9 +26,22 @@ class PrefillEngine:
         self.kv_connector = kv_connector
         self.scheduler = Scheduler(config, model_runner.block_manager)
 
-    def _build_sequence(self, text: str, seq_idx: int, temperature: float, max_tokens: int, ignore_eos: bool) -> Sequence:
+    def _build_sequence(
+        self,
+        text: str,
+        seq_idx: int,
+        temperature: float,
+        max_tokens: int,
+        ignore_eos: bool,
+        session_id: str | None = None,
+    ) -> Sequence:
         token_ids = self.tokenizer(text, add_special_tokens=False)["input_ids"]
-        seq = Sequence(seq_idx=seq_idx, token_ids=token_ids, block_size=self.config.block_size)
+        seq = Sequence(
+            seq_idx=seq_idx,
+            token_ids=token_ids,
+            block_size=self.config.block_size,
+            session_id=session_id,
+        )
         seq.temperature = temperature
         seq.max_tokens = max_tokens
         seq.ignore_eos = ignore_eos
@@ -40,6 +53,7 @@ class PrefillEngine:
         max_tokens: int = 64,
         ignore_eos: bool = True,
         start_seq_id: int = 0,
+        session_ids: list[str | None] | None = None,
     ) -> List[Sequence]:
         seqs = []
         for i, text in enumerate(texts):
@@ -49,6 +63,7 @@ class PrefillEngine:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 ignore_eos=ignore_eos,
+                session_id=session_ids[i] if session_ids is not None else None,
             )
             seqs.append(seq)
         return seqs
@@ -59,7 +74,7 @@ class PrefillEngine:
             transfer_meta = self.kv_connector.save_kv(seq)
         # 在线链路里 request_id 是服务层请求 ID，不能再临时拼 req-{seq_idx}
         request_id = getattr(seq, "request_id", None) or f"req-{seq.seq_idx}"
-        return HandoffPayload(
+        payload = HandoffPayload(
             seq_idx=seq.seq_idx,
             request_id=request_id,
             token_ids=list(seq.token_ids),
@@ -71,6 +86,18 @@ class PrefillEngine:
             finished=finished,
             transfer_meta=transfer_meta,    
         )
+
+        # Agent-aware prefix cache metrics：
+        # HandoffPayload 的核心职责仍然是 P->D handoff；这些字段只给 benchmark 读取，
+        # 用于证明本轮 prefill 是否真的复用了同 session 的 P-local prefix。
+        payload.session_id = getattr(seq, "session_id", None)
+        payload.prefix_cache_hit = bool(getattr(seq, "prefix_cache_hit", False))
+        payload.prefix_cached_tokens = int(getattr(seq, "prefix_cached_tokens", 0))
+        payload.prefix_new_tokens = int(
+            getattr(seq, "prefix_new_tokens", seq.num_prompt_tokens)
+        )
+        payload.prefix_cache_source = getattr(seq, "prefix_cache_source", None)
+        return payload
     
     def _is_handoff_ready(self, seq: Sequence) -> bool:
         # prompt 已经全部写入 KV，且第一枚生成 token 已经产出
@@ -84,6 +111,7 @@ class PrefillEngine:
         max_tokens: int = 64,
         ignore_eos: bool = True,
         request_id: str | None = None,
+        session_id: str | None = None,
         check_admission: bool = False,
     ) -> Sequence:
         """
@@ -95,6 +123,7 @@ class PrefillEngine:
             temperature=temperature,
             max_tokens=max_tokens,
             ignore_eos=ignore_eos,
+            session_id=session_id,
         )
         seq.request_id = request_id
         if check_admission and not self.scheduler.can_admit(seq):
@@ -139,13 +168,31 @@ class PrefillEngine:
                 if seq in self.scheduler.running:
                     self.scheduler.running.remove(seq)
 
-                # prefill侧kv已导出，释放本地block
+                # Agent-aware P-local prefix cache：
+                # PD handoff 的请求不会走 FINISHED 分支，而是在这里从 prefill 侧摘走。
+                # 因此必须在 deallocate() 前保存 session prefix，否则 block_table 会被清空，
+                # 后续同 session 回到这个 prefill worker 时就没有本地 KV blocks 可复用。
+                if getattr(seq, "session_id", None):
+                    self.model_runner.block_manager.save_session_prefix_cache(
+                        seq.session_id,
+                        seq,
+                    )
+
+                # prefill侧kv已导出，释放本地block；cache 自己持有的引用会保留。
                 self.model_runner.block_manager.deallocate(seq)
                 payloads.append(payload)
         
         return payloads
 
-    def run_prefill(self, texts: List[str], temperature: float = 0.0, max_tokens: int = 64, ignore_eos: bool = True, start_seq_id: int=0):
+    def run_prefill(
+        self,
+        texts: List[str],
+        temperature: float = 0.0,
+        max_tokens: int = 64,
+        ignore_eos: bool = True,
+        start_seq_id: int = 0,
+        session_ids: list[str | None] | None = None,
+    ):
         """
         离线批处理，直接处理一批text
         在线预处理使用step逻辑，不执行此函数
@@ -164,6 +211,7 @@ class PrefillEngine:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 ignore_eos=ignore_eos,
+                session_id=session_ids[i] if session_ids is not None else None,
             )
             seqs.append(seq)
 

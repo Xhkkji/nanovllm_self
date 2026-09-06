@@ -26,6 +26,9 @@ MAX_PENDING_SENDS="${MAX_PENDING_SENDS:-1}"
 MAX_PENDING_RECVS="${MAX_PENDING_RECVS:-1}"
 WORKER_FEEDBACK="${WORKER_FEEDBACK:-true}"
 WORKER_FEEDBACK_SCALE_S="${WORKER_FEEDBACK_SCALE_S:-1.0}"
+PREFILL_INITIAL_BACKLOG_S="${PREFILL_INITIAL_BACKLOG_S:-}"
+DECODE_INITIAL_BACKLOG_S="${DECODE_INITIAL_BACKLOG_S:-}"
+AFFINITY_MAX_EXTRA_WAIT_S="${AFFINITY_MAX_EXTRA_WAIT_S:-2.0}"
 
 cd "${ROOT_DIR}"
 
@@ -65,6 +68,9 @@ for strategy in "${strategies[@]}"; do
     --max-pending-sends "${MAX_PENDING_SENDS}" \
     --max-pending-recvs "${MAX_PENDING_RECVS}" \
     --worker-feedback-scale-s "${WORKER_FEEDBACK_SCALE_S}" \
+    --prefill-initial-backlog-s "${PREFILL_INITIAL_BACKLOG_S}" \
+    --decode-initial-backlog-s "${DECODE_INITIAL_BACKLOG_S}" \
+    --affinity-max-extra-wait-s "${AFFINITY_MAX_EXTRA_WAIT_S}" \
     "${worker_feedback_flag}" \
     --work-dir "${strategy_dir}/work" \
     --output "${strategy_dir}/synthetic_metrics.jsonl" \

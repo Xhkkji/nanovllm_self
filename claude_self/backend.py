@@ -12,7 +12,10 @@ class NanovllmBackend:
     3. 后面切到 PDBackend / LangGraph wrapper 时，不需要改 Agent 主循环。
     """
     def __init__(self, model_path="/home/xhk/model/Qwen3-0.6B/", enable_profile=False):
-        self.llm = LLM_self(enable_profile=enable_profile)
+        self.llm = LLM_self(
+            model_path=model_path,
+            enable_profile=enable_profile,
+        )
 
     def generate_text(self, prompt: str, max_tokens: int = 256, metadata: dict | None = None) -> str:
         # Agent-aware 接口预留：
@@ -37,6 +40,7 @@ class NanovllmBackend:
         output_token_ids = self.llm.generate(
             input_ids,
             sampling_params=sampling_params,
+            request_metadata=metadata,
         )
 
         # 4. 只取新生成部分

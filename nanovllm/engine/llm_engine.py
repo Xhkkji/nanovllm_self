@@ -10,6 +10,9 @@ from nanovllm.engine.Sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.sampling_params import SamplingParams
+# TP
+from nanovllm.distributed.parallel_state import init_tensor_parallel
+import os
 
 config = Config(
     model_path="/home/xhk/model/Qwen3-0.6B/",
@@ -23,6 +26,14 @@ config = Config(
 
 class llm_engine():
   def __init__(self, tensor_parallel_size=1):
+    # # 设置多卡推理环境
+    # init_tensor_parallel(tensor_parallel_size)
+    # if tensor_parallel_size > 1:
+    #   local_rank = int(os.environ["LOCAL_RANK"])
+    #   self.config.device = f"cuda:{local_rank}"
+    # else:
+    #   self.config.device = "cuda:0"
+    
     # self.text = text
     self.tokenizer = AutoTokenizer.from_pretrained('/home/xhk/model/Qwen3-0.6B')
     self.model = AutoModelForCausalLM.from_pretrained("/home/xhk/model/Qwen3-0.6B",
@@ -85,10 +96,22 @@ class llm_engine():
     return self.tokenizer.decode(all_tokens[0], skip_special_tokens=True)
 
 class llm_engine_self():
-  def __init__(self, tensor_parallel_size=1, enable_profile=False):
+  def __init__(self, model_path="/home/xhk/model/Qwen3-0.6B", tensor_parallel_size=1, enable_profile=False):
     # print("llm_engine_self..")
-    self.tokenizer = AutoTokenizer.from_pretrained('/home/xhk/model/Qwen3-0.6B')
+    # TP 最小主线：LLM_self 这条自研 runtime 主链也必须先初始化
+    # torch.distributed，并把当前进程绑定到 LOCAL_RANK 对应的 GPU。
+    init_tensor_parallel(tensor_parallel_size)
+
     self.config = config
+    self.config.model_path = model_path
+    self.tokenizer = AutoTokenizer.from_pretrained(self.config.model_path)
+    
+    if tensor_parallel_size > 1:
+      local_rank = int(os.environ["LOCAL_RANK"])
+      self.config.device = f"cuda:{local_rank}"
+    else:
+      self.config.device = "cuda:0"
+      
     self.tensor_parallel_size = tensor_parallel_size
     self.enable_profile = enable_profile
     self.eos_token_id = self.tokenizer.eos_token_id
@@ -106,15 +129,22 @@ class llm_engine_self():
   def encoder(self, text):
     return self.tokenizer(text)
   
-  def generate(self, inputs, sampling_params=None, return_metrics=False):
+  def generate(self, inputs, sampling_params=None, return_metrics=False, request_metadata: dict | None = None):
     if sampling_params is None:
       sampling_params = [SamplingParams()] * len(inputs)
     
+    # Agent-aware prompt caching：
+    # Agent / Backend 会通过 request_metadata 传入 session_id。
+    # 同一个 session_id 的多轮请求可以在 block_manager 里查找并复用前缀 KV blocks。
+    session_id = None
+    if request_metadata is not None:
+      session_id = request_metadata.get("session_id") or request_metadata.get("program_id")
+
     all_seqs = []
     # print("\n创建Sequence...")
     # print(f"  Prompt tokens: {inputs}")
     for i, input in enumerate(inputs):
-      seq = Sequence(seq_idx=i, token_ids=input.tolist(), sampling_params=sampling_params[i], block_size=self.config.block_size)  # 取出 token 列表,没有batch维度
+      seq = Sequence(seq_idx=i, token_ids=input.tolist(), sampling_params=sampling_params[i], block_size=self.config.block_size, session_id=session_id)  # 取出 token 列表,没有batch维度
       self.scheduler.add(seq)
       all_seqs.append(seq)
     

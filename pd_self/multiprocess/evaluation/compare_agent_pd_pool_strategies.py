@@ -59,6 +59,23 @@ def strategy_metrics(summary_path: Path) -> dict:
         for row in measured
     )
     affinity_hits = sum(1 for row in measured if row.get("affinity_hit"))
+    prefill_affinity_hits = sum(
+        1 for row in measured if row.get("prefill_affinity_hit")
+    )
+    decode_affinity_hits = sum(
+        1 for row in measured if row.get("decode_affinity_hit")
+    )
+    prefix_cache_hits = sum(1 for row in measured if row.get("prefix_cache_hit"))
+    prefix_cached_tokens = [
+        int(row.get("prefix_cached_tokens", 0))
+        for row in measured
+        if row.get("prefix_cache_hit")
+    ]
+    prefix_new_tokens = [
+        int(row.get("prefix_new_tokens", 0))
+        for row in measured
+        if row.get("prefix_cache_hit")
+    ]
     cross_routes = sum(
         1
         for row in measured
@@ -89,6 +106,20 @@ def strategy_metrics(summary_path: Path) -> dict:
         "transfer_avg_s": avg(transfer_times),
         "affinity_hits": affinity_hits,
         "affinity_hit_rate": affinity_hits / len(measured) if measured else 0.0,
+        "prefill_affinity_hits": prefill_affinity_hits,
+        "prefill_affinity_hit_rate": (
+            prefill_affinity_hits / len(measured) if measured else 0.0
+        ),
+        "decode_affinity_hits": decode_affinity_hits,
+        "decode_affinity_hit_rate": (
+            decode_affinity_hits / len(measured) if measured else 0.0
+        ),
+        "prefix_cache_hits": prefix_cache_hits,
+        "prefix_cache_hit_rate": (
+            prefix_cache_hits / len(measured) if measured else 0.0
+        ),
+        "prefix_cached_tokens_avg_on_hit": avg(prefix_cached_tokens),
+        "prefix_new_tokens_avg_on_hit": avg(prefix_new_tokens),
         "cross_route_count": cross_routes,
         "cross_route_rate": cross_routes / len(measured) if measured else 0.0,
         "prefill_worker_counts": dict(prefill_counts),
@@ -103,18 +134,21 @@ def strategy_metrics(summary_path: Path) -> dict:
 def markdown_table(results: dict) -> str:
     """生成一个简短 Markdown 表，方便直接贴到文档或简历材料里。"""
     lines = [
-        "| strategy | reqs | tok/s | wall avg(s) | wall p90(s) | affinity | cross-route |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| strategy | reqs | tok/s | wall avg(s) | wall p90(s) | affinity | P affinity | D affinity | prefix hit | cross-route |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for name, result in results.items():
         lines.append(
-            "| {name} | {reqs} | {tok_s:.4f} | {avg_s:.4f} | {p90_s:.4f} | {aff:.2%} | {cross:.2%} |".format(
+            "| {name} | {reqs} | {tok_s:.4f} | {avg_s:.4f} | {p90_s:.4f} | {aff:.2%} | {paff:.2%} | {daff:.2%} | {phit:.2%} | {cross:.2%} |".format(
                 name=name,
                 reqs=result.get("measured_requests", 0),
                 tok_s=float(result.get("pipeline_throughput_generated_tok_s") or 0.0),
                 avg_s=float(result.get("wall_e2e_avg_s") or 0.0),
                 p90_s=float(result.get("wall_e2e_p90_s") or 0.0),
                 aff=float(result.get("affinity_hit_rate") or 0.0),
+                paff=float(result.get("prefill_affinity_hit_rate") or 0.0),
+                daff=float(result.get("decode_affinity_hit_rate") or 0.0),
+                phit=float(result.get("prefix_cache_hit_rate") or 0.0),
                 cross=float(result.get("cross_route_rate") or 0.0),
             )
         )

@@ -44,6 +44,24 @@ def parse_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def parse_float_csv(value: str, expected: int, name: str) -> list[float]:
+    """
+    ########################### Agent-aware 调度实验参数 ###########################
+    解析每个 worker 的初始虚拟 backlog。
+
+    这个参数只影响 driver 侧的路由决策，不会真的让 worker sleep。
+    用途是模拟真实 Agent serving 里某些 worker 已经被复杂 session 拖住的情况：
+      - round-robin 仍然按顺序继续塞请求；
+      - load-aware / affinity-load-aware 会感知这个初始积压并绕开。
+    """
+    if not value:
+        return [0.0] * expected
+    values = [float(item.strip()) for item in value.split(",") if item.strip()]
+    if len(values) != expected:
+        raise ValueError(f"--{name} expects {expected} values, got {len(values)}")
+    return values
+
+
 def pool_visible_devices(args) -> str:
     """
     ########################### NCCL 池化 PD GPU 可见性 ###########################
@@ -152,6 +170,48 @@ def select_least_loaded_worker(
     return best_worker
 
 
+def select_affinity_load_aware_worker(
+    workers: list[dict],
+    service_time_s: float,
+    request_index: int,
+    session_id: str,
+    session_to_worker: dict[str, int],
+    worker_id_key: str,
+    config: AgentSchedulerConfig,
+) -> tuple[dict, bool, int | None]:
+    """
+    ########################### Agent-aware P/D 双侧亲和 ###########################
+    在 dict worker 结构上复用同一套亲和逻辑：
+      - P 侧：同 session 优先回到保存了 P-local prefix cache 的 prefill worker；
+      - D 侧：同 session 优先回到原 decode worker，维持 decode locality；
+      - 两侧都保留 load-aware 兜底，preferred worker 明显过载时允许迁移。
+    """
+    preferred_worker_id = session_to_worker.get(session_id)
+    best = select_least_loaded_worker(
+        workers,
+        service_time_s,
+        request_index,
+        "load_aware",
+    )
+
+    if preferred_worker_id is None:
+        session_to_worker[session_id] = best[worker_id_key]
+        return best, False, None
+
+    preferred = workers[preferred_worker_id]
+    extra_wait_s = (
+        worker_queue_wait_s(preferred)
+        + preferred.get("feedback_load_s", 0.0)
+        - worker_queue_wait_s(best)
+        - best.get("feedback_load_s", 0.0)
+    )
+    if extra_wait_s <= config.affinity_max_extra_wait_s:
+        return preferred, True, preferred_worker_id
+
+    session_to_worker[session_id] = best[worker_id_key]
+    return best, False, preferred_worker_id
+
+
 def assign_virtual_work(worker: dict, service_time_s: float, max_tokens: int) -> dict:
     """
     更新 driver 侧虚拟 worker 状态。
@@ -193,6 +253,16 @@ def build_pool_workers(args, root_work_dir: Path) -> tuple[list[dict], list[dict
         raise ValueError("prefill_gpus and decode_gpus must be non-empty")
 
     world_size = len(prefill_gpus) + len(decode_gpus)
+    prefill_backlogs = parse_float_csv(
+        args.prefill_initial_backlog_s,
+        len(prefill_gpus),
+        "prefill-initial-backlog-s",
+    )
+    decode_backlogs = parse_float_csv(
+        args.decode_initial_backlog_s,
+        len(decode_gpus),
+        "decode-initial-backlog-s",
+    )
 
     prefill_workers = []
     for idx, gpu in enumerate(prefill_gpus):
@@ -208,8 +278,10 @@ def build_pool_workers(args, root_work_dir: Path) -> tuple[list[dict], list[dict
                 "world_size": world_size,
                 "work_dir": work_dir,
                 "log": work_dir / "persistent_prefill.log",
-                "available_at_s": 0.0,
-                "busy_time_s": 0.0,
+                # Agent-aware 调度实验：只给 driver 的虚拟 slot 加初始积压，
+                # 用来观察不同路由策略面对不均衡 worker 时的决策差异。
+                "available_at_s": prefill_backlogs[idx],
+                "busy_time_s": prefill_backlogs[idx],
                 "num_requests": 0,
                 "generated_tokens": 0,
                 "feedback_load_s": 0.0,
@@ -231,8 +303,10 @@ def build_pool_workers(args, root_work_dir: Path) -> tuple[list[dict], list[dict
                 "world_size": world_size,
                 "work_dir": work_dir,
                 "log": work_dir / "persistent_decode.log",
-                "available_at_s": 0.0,
-                "busy_time_s": 0.0,
+                # Agent-aware 调度实验：decode 侧初始积压最能体现 Agent 场景痛点，
+                # 因为复杂多步任务通常会长期占用 D worker。
+                "available_at_s": decode_backlogs[idx],
+                "busy_time_s": decode_backlogs[idx],
                 "num_requests": 0,
                 "generated_tokens": 0,
                 "feedback_load_s": 0.0,
@@ -462,6 +536,7 @@ def schedule_pool_request(
     config: AgentSchedulerConfig,
     prefill_workers: list[dict],
     decode_workers: list[dict],
+    session_to_prefill_worker: dict[str, int],
     session_to_decode_worker: dict[str, int],
     row: dict,
     idx: int,
@@ -483,35 +558,42 @@ def schedule_pool_request(
     prefill_service_s = estimate_prefill_time_s(row, config)
     decode_service_s = estimate_decode_time_s(max_tokens, config)
 
-    prefill = select_least_loaded_worker(
-        prefill_workers,
-        prefill_service_s,
-        idx,
-        args.scheduler,
-    )
-
-    affinity_hit = False
-    preferred_decode_worker_id = session_to_decode_worker.get(estimate.session_id)
-    if args.scheduler == "affinity_load_aware" and preferred_decode_worker_id is not None:
-        preferred = decode_workers[preferred_decode_worker_id]
-        best = select_least_loaded_worker(
-            decode_workers,
-            decode_service_s,
+    prefill_affinity_hit = False
+    preferred_prefill_worker_id = session_to_prefill_worker.get(estimate.session_id)
+    if args.scheduler == "affinity_load_aware":
+        prefill, prefill_affinity_hit, preferred_prefill_worker_id = (
+            select_affinity_load_aware_worker(
+                prefill_workers,
+                prefill_service_s,
+                idx,
+                estimate.session_id,
+                session_to_prefill_worker,
+                "prefill_worker_id",
+                config,
+            )
+        )
+    else:
+        prefill = select_least_loaded_worker(
+            prefill_workers,
+            prefill_service_s,
             idx,
-            "load_aware",
+            args.scheduler,
         )
-        extra_wait_s = (
-            worker_queue_wait_s(preferred)
-            + preferred.get("feedback_load_s", 0.0)
-            - worker_queue_wait_s(best)
-            - best.get("feedback_load_s", 0.0)
+
+    decode_affinity_hit = False
+    preferred_decode_worker_id = session_to_decode_worker.get(estimate.session_id)
+    if args.scheduler == "affinity_load_aware":
+        decode, decode_affinity_hit, preferred_decode_worker_id = (
+            select_affinity_load_aware_worker(
+                decode_workers,
+                decode_service_s,
+                idx,
+                estimate.session_id,
+                session_to_decode_worker,
+                "decode_worker_id",
+                config,
+            )
         )
-        if extra_wait_s <= config.affinity_max_extra_wait_s:
-            decode = preferred
-            affinity_hit = True
-        else:
-            decode = best
-            session_to_decode_worker[estimate.session_id] = decode["decode_worker_id"]
     else:
         decode = select_least_loaded_worker(
             decode_workers,
@@ -519,8 +601,6 @@ def schedule_pool_request(
             idx,
             args.scheduler,
         )
-        if args.scheduler == "affinity_load_aware":
-            session_to_decode_worker[estimate.session_id] = decode["decode_worker_id"]
 
     prefill_slot_meta = assign_virtual_work(prefill, prefill_service_s, max_tokens)
     decode_slot_meta = assign_virtual_work(decode, decode_service_s, max_tokens)
@@ -536,7 +616,10 @@ def schedule_pool_request(
         "estimated_tool_calls": estimate.estimated_tool_calls,
         "estimated_steps": estimate.estimated_steps,
         "complexity_score": estimate.complexity_score,
-        "affinity_hit": affinity_hit,
+        "affinity_hit": prefill_affinity_hit or decode_affinity_hit,
+        "prefill_affinity_hit": prefill_affinity_hit,
+        "decode_affinity_hit": decode_affinity_hit,
+        "preferred_prefill_worker_id": preferred_prefill_worker_id,
         "preferred_decode_worker_id": preferred_decode_worker_id,
         "prefill_worker_id": prefill["prefill_worker_id"],
         "decode_worker_id": decode["decode_worker_id"],
@@ -568,6 +651,7 @@ def submit_one_pool(
     config: AgentSchedulerConfig,
     prefill_workers: list[dict],
     decode_workers: list[dict],
+    session_to_prefill_worker: dict[str, int],
     session_to_decode_worker: dict[str, int],
     entry,
 ) -> tuple[str, dict, dict, float]:
@@ -580,6 +664,7 @@ def submit_one_pool(
         config,
         prefill_workers,
         decode_workers,
+        session_to_prefill_worker,
         session_to_decode_worker,
         row,
         idx,
@@ -632,6 +717,7 @@ def submit_entries(
     config: AgentSchedulerConfig,
     prefill_workers: list[dict],
     decode_workers: list[dict],
+    session_to_prefill_worker: dict[str, int],
     session_to_decode_worker: dict[str, int],
     entries,
 ) -> tuple[dict, dict, dict, float | None]:
@@ -647,6 +733,7 @@ def submit_entries(
             config,
             prefill_workers,
             decode_workers,
+            session_to_prefill_worker,
             session_to_decode_worker,
             entry,
         )
@@ -663,6 +750,7 @@ def run_closed_loop(
     config: AgentSchedulerConfig,
     prefill_workers: list[dict],
     decode_workers: list[dict],
+    session_to_prefill_worker: dict[str, int],
     session_to_decode_worker: dict[str, int],
     entries,
 ) -> tuple[dict, dict, dict, dict, float | None, float | None]:
@@ -689,6 +777,7 @@ def run_closed_loop(
                 config,
                 prefill_workers,
                 decode_workers,
+                session_to_prefill_worker,
                 session_to_decode_worker,
                 entries[next_idx],
             )
@@ -780,6 +869,22 @@ def parse_args():
         default=1.0,
         help="Scale applied when converting worker_state counters into scheduler load seconds.",
     )
+    parser.add_argument(
+        "--prefill-initial-backlog-s",
+        default="",
+        help="Comma-separated virtual initial backlog seconds for prefill workers.",
+    )
+    parser.add_argument(
+        "--decode-initial-backlog-s",
+        default="",
+        help="Comma-separated virtual initial backlog seconds for decode workers.",
+    )
+    parser.add_argument(
+        "--affinity-max-extra-wait-s",
+        type=float,
+        default=2.0,
+        help="Max extra wait allowed before affinity_load_aware migrates away from preferred decode worker.",
+    )
     return parser.parse_args()
 
 
@@ -811,6 +916,11 @@ def main():
     root_work_dir.mkdir(parents=True, exist_ok=True)
     prefill_workers, decode_workers = build_pool_workers(args, root_work_dir)
     config = AgentSchedulerConfig()
+    # Agent-aware 调度实验：把 affinity 的“愿意多等多久”暴露出来。
+    # 默认 2s 偏保守，适合强调 locality；调小后更像“有明显收益才亲和”，
+    # 能避免 affinity 在拥塞场景下过度粘住某个 decode worker。
+    config.affinity_max_extra_wait_s = args.affinity_max_extra_wait_s
+    session_to_prefill_worker = {}
     session_to_decode_worker = {}
     procs = []
     ready = []
@@ -836,6 +946,7 @@ def main():
                 config,
                 prefill_workers,
                 decode_workers,
+                session_to_prefill_worker,
                 session_to_decode_worker,
                 warmup_entries,
             )
@@ -868,6 +979,7 @@ def main():
                 config,
                 prefill_workers,
                 decode_workers,
+                session_to_prefill_worker,
                 session_to_decode_worker,
                 measure_entries,
             )
@@ -877,6 +989,7 @@ def main():
                 config,
                 prefill_workers,
                 decode_workers,
+                session_to_prefill_worker,
                 session_to_decode_worker,
                 measure_entries,
             )

@@ -12,10 +12,15 @@ class Sequence:
     序列类，代表一个推理请求
     一个Sequence实例对应一个batch，多batch对应多个sequence实例
     """
-    def __init__(self, seq_idx: int, token_ids: list[int], sampling_params = SamplingParams(), block_size=16):
+    def __init__(self, seq_idx: int, token_ids: list[int], sampling_params = SamplingParams(), block_size=16, session_id: str | None = None,):
         self.seq_idx = seq_idx  # 序列id，整个token的ids
         # 【本次在线化改动】request_id 开始作为服务层请求标识使用，和 seq_idx 解耦
         self.request_id = None
+        # Agent-aware prefix cache：
+        # session_id 用来标识“同一个用户 / 同一个 Agent 任务”的多轮请求。
+        # block_manager 后续可以用它查找该 session 上一次留下的 prefix KV blocks。
+        self.session_id = session_id
+        
         self.token_ids = token_ids
         self.token_len = len(token_ids)
         self.last_token = token_ids[-1]

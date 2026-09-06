@@ -440,6 +440,17 @@ def build_metrics_rows(args, paths_by_base, metadata_by_base, submit_times, comp
                 "num_kv_blocks": prefill_metrics.get("num_kv_blocks", 0),
                 "kv_nbytes": prefill_metrics.get("kv_nbytes", 0),
                 "scale_nbytes": prefill_metrics.get("scale_nbytes", 0),
+                # Agent-aware P-local prefix cache 观测字段：
+                # 这些字段来自 prefill worker，表示本轮 prefill 开始前是否复用了历史 prefix。
+                "prefix_cache_hit": bool(prefill_metrics.get("prefix_cache_hit", False)),
+                "prefix_cached_tokens": int(prefill_metrics.get("prefix_cached_tokens", 0)),
+                "prefix_new_tokens": int(
+                    prefill_metrics.get(
+                        "prefix_new_tokens",
+                        prefill_metrics.get("num_prompt_tokens", 0),
+                    )
+                ),
+                "prefix_cache_source": prefill_metrics.get("prefix_cache_source"),
                 "prefill_metrics": str(paths["prefill_metrics"]),
                 "decode_metrics": str(paths["decode_metrics"]),
             }

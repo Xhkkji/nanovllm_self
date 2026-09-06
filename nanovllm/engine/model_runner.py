@@ -16,16 +16,20 @@ class ModelRunner(nn.Module):
         super().__init__()
         self.config = config
         self.device = self.config.device
-        model_config = AutoConfig.from_pretrained("/home/xhk/model/Qwen3-0.6B/")
-        self.model = Qwen3Model(model_config).to(self.device)
+        model_config = AutoConfig.from_pretrained(self.config.model_path)
+        # TP/大模型测试主线：ModelRunner 只负责从 Config 读取统一的模型路径。
+        # 真正的权重加载仍然封装在 Qwen3Model 内部，后续如果改成 safetensors
+        # 分片流式加载，也只需要继续收敛在 Qwen3Model 里，不影响调度器。
+        self.model = Qwen3Model(model_config, model_path=self.config.model_path).to(self.device)
         self.sampler = Sampler()
         # print("\n创建 BlockManager...")
         self.block_manager = block_manager(
             num_blocks=self.config.num_blocks,
             block_size=self.config.block_size,
             num_layers=self.model.num_layers,
-            num_kv_heads=self.model.num_kv_heads,
-            head_dim=self.model.head_dim
+            # TP: 每个rank只存自己负责的kv_heads
+            num_kv_heads=self.model.local_num_kv_heads,
+            head_dim=self.model.head_dim,
         )
 
         # 判断精度是否支持
@@ -38,7 +42,8 @@ class ModelRunner(nn.Module):
             self.model.num_layers,
             self.config.num_blocks,
             self.config.block_size,
-            self.model.num_kv_heads,
+            # TP: KV cache 按 local kv heads 分片。
+            self.model.local_num_kv_heads,
             self.model.head_dim,
             dtype=config.kv_cache_dtype,
             device=config.device
@@ -60,7 +65,8 @@ class ModelRunner(nn.Module):
                 self.model.num_layers,
                 self.config.num_blocks,
                 self.config.block_size,
-                self.model.num_kv_heads,
+                # TP
+                self.model.local_num_kv_heads,
                 1,
                 dtype=self.config.kv_cache_scale_dtype,
                 device=self.config.device,
@@ -571,4 +577,3 @@ class ModelRunner(nn.Module):
                 "[WARN] fp32 kv_cache_dtype may not be supported by flash-attn; "
                 "use torch attention path for fp32 correctness test."
             )
-

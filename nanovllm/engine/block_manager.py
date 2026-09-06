@@ -1,4 +1,5 @@
 from collections import deque
+from dataclasses import dataclass
 from typing import List, Tuple
 import xxhash
 import torch
@@ -10,6 +11,17 @@ engine_config = {
     "prefix_cache_hash_algo": "sha256",  # 哈希算法
     "block_size": 32,  # 推荐 32
 }
+
+@dataclass
+class SessionPrefixCacheEntry:
+    # 已缓存的 token 前缀，只保存完整 block 对应的 token。
+    token_ids: list[int]
+
+    # 对应的物理 KV block id。
+    block_ids: list[int]
+
+    # 已缓存 token 数，必须是 block_size 的整数倍。
+    num_cached_tokens: int
 
 class Block:
     """
@@ -41,6 +53,11 @@ class block_manager:
         总共 4096 个块
         每个块4个token
         """
+        # Agent-aware prefix cache：
+        # session_id -> 上一次保留下来的完整 prefix KV blocks。
+        # 第一版只做单 worker / 单进程本地缓存，不做跨 worker 迁移。
+        self.session_prefix_cache: dict[str, SessionPrefixCacheEntry] = {}
+                
         self.num_blocks = num_blocks  # 需要分配的块的数量
         self.block_size = block_size  # 一个块分配多大的空间，即一个块多少个token
         self.enable_prefix_cache = enable_prefix_cache  # 启用前缀共享
@@ -55,6 +72,68 @@ class block_manager:
         #     num_blocks, block_size, 2, num_layers, num_kv_heads, head_dim,
         #     dtype=dtype, device=device
         # )
+    
+    def _release_session_prefix_cache(self, session_id: str):
+        """
+        Agent-aware prefix cache：
+        释放某个 session 旧的 prefix cache 引用。
+
+        注意：
+        这里只释放 cache 自己持有的引用。
+        如果某个正在运行的 seq 还在用这些 block，
+        ref_count 不会归零，block 不会真的释放。
+        """
+        old = self.session_prefix_cache.pop(session_id, None)
+        if old is None:
+            return
+
+        self.free_blocks(old.block_ids)
+
+
+    def save_session_prefix_cache(self, session_id: str, seq: Sequence):
+        """
+        Agent-aware prefix cache：
+        在一个请求结束前，把该 session 已经算好的完整 KV blocks 留下来。
+
+        第一版为了简单，只缓存“完整 block”：
+        - 不缓存最后一个不满的 block；
+        - 避免处理 partial block 和最后一个 token 尚未写入 KV 的边界问题。
+        """
+        if not session_id:
+            return
+
+        # Agent-aware prompt caching：
+        # postprocess() 里判断请求结束时，本轮刚完成的 prefill/decode token
+        # 还没有统一累加到 seq.num_cached_tokens。
+        # 因此这里用 num_cached_tokens + num_new_tokens 表示“本轮结束后真实已经写入 KV 的长度”。
+        # 注意 append_token() 新追加出来的是“下一枚待 decode 的 token”，它的 KV 还没算，
+        # 所以最多只能缓存到 len(seq.token_ids) - 1。
+        num_cached = min(
+            seq.num_cached_tokens + seq.num_new_tokens,
+            max(0, len(seq.token_ids) - 1),
+        )
+        full_blocks = num_cached // self.block_size
+        if full_blocks <= 0:
+            return
+
+        cached_tokens = full_blocks * self.block_size
+        block_ids = list(seq.block_table[:full_blocks])
+        token_ids = list(seq.token_ids[:cached_tokens])
+
+        # 替换旧 cache 前，先释放旧 cache 持有的引用。
+        # 也就是先清除引入计数，后面再整体加一，而不是把旧块删除再写入
+        self._release_session_prefix_cache(session_id)
+
+        # 给 cache 自己增加一份引用。
+        # 这样 seq 结束 deallocate 后，这些 block 不会被释放。
+        for block_id in block_ids:
+            self.blocks[block_id].ref_count += 1
+
+        self.session_prefix_cache[session_id] = SessionPrefixCacheEntry(
+            token_ids=token_ids,
+            block_ids=block_ids,
+            num_cached_tokens=cached_tokens,
+        )
 
     # 【第四章收口改动】在线服务观测接口：只读 block manager 状态，不改变分配逻辑。
     def num_free_blocks(self):
@@ -229,17 +308,60 @@ class block_manager:
         """
         传入的是一个seq类，在prefill阶段直接分配块
         复用block，查看前缀block，一旦发生cache_miss,则后续全部分配新block
+        
+        prefill 阶段分配 KV blocks。
+
+        Agent-aware prefix cache 最小逻辑：
+        1. 如果 seq.session_id 命中缓存；
+        2. 并且当前请求 token_ids 以缓存 token_ids 为前缀；
+        3. 那么直接复用缓存 block；
+        4. 后续只给 suffix 分配新 block。
         """
+        # Agent-aware prefix cache metrics：
+        # 这些字段只用于观测，不参与正确性判断。每次 allocate 都先清零，
+        # 避免同一个 Sequence 对象复用时残留上一轮状态。
+        seq.prefix_cache_hit = False
+        seq.prefix_cached_tokens = 0
+        seq.prefix_new_tokens = seq.num_prompt_tokens
+        seq.prefix_cache_source = None
+
         prev_hash = -1
         cache_miss = False
         physical_blocks = []
         
         token_ids = seq.token_ids  # 取出 token 列表
+        start_pos = 0
+        
+        session_id = getattr(seq, "session_id", None)
+        if session_id:
+            entry = self.session_prefix_cache.get(session_id)
+
+            if entry is not None and token_ids[:entry.num_cached_tokens] == entry.token_ids:
+                # 命中同一个 Agent session 的 prefix cache。
+                physical_blocks.extend(entry.block_ids)
+
+                # 当前 seq 自己也要持有这些 block 的引用。
+                for block_id in entry.block_ids:
+                    self.blocks[block_id].ref_count += 1
+
+                seq.num_cached_tokens = entry.num_cached_tokens
+                start_pos = entry.num_cached_tokens
+                seq.prefix_cache_hit = entry.num_cached_tokens > 0
+                seq.prefix_cached_tokens = entry.num_cached_tokens
+                seq.prefix_new_tokens = max(
+                    0,
+                    seq.num_prompt_tokens - entry.num_cached_tokens,
+                )
+                seq.prefix_cache_source = "session_local"
+
+                if entry.block_ids:
+                    prev_hash = self.blocks[entry.block_ids[-1]].hash
+
         # token_ids 是 List[int]，形状是 [seq_len]
         # 例如: [1, 2, 3, 4, 5, 6, 7, 8, 9]
         # print(f"[Debug] allocate_with_prefill: Allocating blocks for tokens: {token_ids}")  # 添加调试输出，查看输入的 token 列表
         # 计算前缀数组，一旦cachemiss则后续全部新分配
-        for i in range(0, len(token_ids), self.block_size):
+        for i in range(start_pos, len(token_ids), self.block_size):
             block_tokens = token_ids[i: i+self.block_size]  # 以block_size为单位进行切片，若最后一个块不满，会自动切片，只填入剩余的idx
             is_full = len(block_tokens) == self.block_size
             if not is_full:
@@ -264,7 +386,6 @@ class block_manager:
 
                 # 如果是完整块，注册到哈希表
                 if is_full:
-                    self.blocks[new_idx].ref_count = 1
                     self.hash_to_block_id[current_hash] = new_idx
             # 复用已有块
             else:

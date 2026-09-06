@@ -234,6 +234,12 @@ class Scheduler:
             if (not seq.ignore_eos and token_id == self.eos) or \
                 (seq.num_completion_tokens == seq.max_tokens):
                 seq.status = SequenceStatus.FINISHED
+                if getattr(seq, "session_id", None):
+                    # Agent-aware prompt caching：
+                    # 必须在 deallocate() 之前保存 prefix cache。
+                    # deallocate() 会清空 seq.block_table；如果顺序反了，cache 会拿不到物理 KV blocks。
+                    self.block_manager.save_session_prefix_cache(seq.session_id, seq)
+
                 self.block_manager.deallocate(seq)
                 if seq in self.running:
                     self.running.remove(seq)
@@ -275,7 +281,6 @@ class Scheduler:
                 return True
 
         return False
-
 
 
 

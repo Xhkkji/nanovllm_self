@@ -139,6 +139,23 @@ def request_base(request_path: Path) -> str:
     return name[: -len(suffix)]
 
 
+def resolve_request_session_id(request: dict, request_id: str) -> str:
+    """
+    Agent-aware P-local prefix cache：
+    从请求里解析同一个 Agent 会话的稳定 ID。
+
+    这个 ID 会传给 nano-vLLM 的 Sequence，BlockManager 才能在本地维护：
+      session_id -> prefix KV blocks
+    """
+    return str(
+        request.get("program_id")
+        or request.get("session_id")
+        or request.get("conversation_id")
+        or request.get("source_id")
+        or request_id
+    )
+
+
 def build_paths(work_dir: Path, base: str):
     """
     prefill 侧文件协议。
@@ -343,6 +360,7 @@ def process_request(args, engine, backend, request_path: Path, seq_idx: int, con
 
     prompt = request["prompt"]
     request_id = request.get("id", base)
+    session_id = resolve_request_session_id(request, request_id)
     max_tokens = int(request.get("max_tokens", request.get("output_len", 2)))
     # max_tokens=1 会在 prefill 侧直接完成，没有 decode 阶段。
     # 常驻 PD benchmark 需要测 restore/decode，所以强制至少 2。
@@ -379,6 +397,7 @@ def process_request(args, engine, backend, request_path: Path, seq_idx: int, con
             max_tokens=max_tokens,
             ignore_eos=True,
             start_seq_id=seq_idx,
+            session_ids=[session_id],
         )[0]
         # 用 benchmark request_id 覆盖默认 req-{seq_idx}，方便结果文件和 dataset 对齐。
         payload.request_id = request_id
@@ -505,6 +524,7 @@ def process_request(args, engine, backend, request_path: Path, seq_idx: int, con
             "role": "persistent_prefill",
             "request_id": request_id,
             "profile": request.get("profile"),
+            "session_id": session_id,
             "input_tokens_dataset": request.get("input_tokens"),
             "max_tokens": max_tokens,
             "total_tokens_dataset": request.get("total_tokens"),
@@ -512,6 +532,18 @@ def process_request(args, engine, backend, request_path: Path, seq_idx: int, con
             "payload_finished": payload.finished,
             "num_prompt_tokens": payload.num_prompt_tokens,
             "num_cached_tokens": payload.num_cached_tokens,
+            # prefix_cache_* 表示“本轮 prefill 开始前复用了多少历史 prefix”，
+            # 不等同于 payload.num_cached_tokens。后者表示本轮结束后 prompt 已写入 KV 的长度。
+            "prefix_cache_hit": bool(
+                getattr(payload, "prefix_cache_hit", False)
+            ),
+            "prefix_cached_tokens": int(
+                getattr(payload, "prefix_cached_tokens", 0)
+            ),
+            "prefix_new_tokens": int(
+                getattr(payload, "prefix_new_tokens", payload.num_prompt_tokens)
+            ),
+            "prefix_cache_source": getattr(payload, "prefix_cache_source", None),
             "token_len": len(payload.token_ids),
             "num_kv_blocks": meta.num_kv_blocks if meta is not None else 0,
             "kv_nbytes": meta.storage_ref.nbytes if meta is not None and meta.storage_ref is not None else 0,
